@@ -1,3 +1,51 @@
+# Byte-code files
+__pycache__/
+*.py[cod]
+*.pyd
+$py.class
+
+# Temporary files, build artifacts and distribution
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.manifest
+*.mo
+*.pot
+*.seed
+*.par
+
+# Virtual environment
+# Change "venv" to the name of your virtual environment directory, if it's different.
+venv/
+.venv/
+env/
+.env/
+
+# Data and log files
+*.log
+*.sql
+*.sqlite
+/local_settings.py # Example for a sensitive config file
+
+# OS and editor files (consider using a global gitignore for these)
+.DS_Store # macOS
+.project
+.idea/      # PyCharm
+.vscode/    # VS Code
+thumbs.db   # Windows
 scratch/
 archive/
 cache/
