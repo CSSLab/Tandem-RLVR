@@ -665,6 +665,10 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        guillemet_count = sum(1 for text in sample_outputs if "<<" in text or ">>" in text)
+        guillemet_rate = guillemet_count / len(sample_outputs) if sample_outputs else 0.0
+        metric_dict["val-core/guillemet_rate"] = guillemet_rate
+
         return metric_dict
 
     def init_workers(self):
@@ -856,6 +860,10 @@ class RayPPOTrainer:
                 print("Training from scratch")
                 self.actor_rollout_wg.load_checkpoint(None)
                 return 0
+        elif self.config.trainer.resume_mode == "never":
+            print("Training from scratch (resume_mode=never)")
+            self.actor_rollout_wg.load_checkpoint(None)
+            return 0
         else:
             if self.config.trainer.resume_mode == "resume_path":
                 assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"

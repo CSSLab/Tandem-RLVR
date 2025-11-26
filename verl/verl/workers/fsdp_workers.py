@@ -914,11 +914,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def generate_sequences(self, prompts: DataProto):
         # Check if this is validation
         is_validation = prompts.meta_info.get("validate", False)
-        if is_validation:
+        tandem_config = self.config.rollout.get("tandem", None)
+
+        # Only use custom vLLM validation if tandem is enabled
+        if is_validation and tandem_config is not None and tandem_config.get("enabled", False):
             logger.info("TANDEM: Using vLLM for fast validation")
             return self._vllm_validation_generate(prompts)
 
-        tandem_config = self.config.rollout.get("tandem", None)
+        # For vanilla GRPO, fall through to standard vLLM rollout for validation
 
         if tandem_config is not None and tandem_config.get("enabled", False):
             logger.info("TANDEM: Using tandem generation for training")
@@ -999,29 +1002,42 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         dist.barrier()
 
-        if not hasattr(self, '_vllm_engine'):
-            logger.info("Initializing vLLM engine for validation on GPU 0...")
+        if hasattr(self, '_vllm_engine'):
+            logger.info("Destroying old vLLM engine to reload updated weights...")
+            try:
+                if hasattr(self._vllm_engine, 'llm_engine'):
+                    if hasattr(self._vllm_engine.llm_engine, 'driver_worker'):
+                        del self._vllm_engine.llm_engine.driver_worker
+                    if hasattr(self._vllm_engine.llm_engine, 'model_executor'):
+                        del self._vllm_engine.llm_engine.model_executor
+                    del self._vllm_engine.llm_engine
+            except Exception as e:
+                logger.warning(f"Error cleaning vLLM engine: {e}")
+            del self._vllm_engine
+            get_torch_device().empty_cache()
 
-            val_response_length = self.config.rollout.get('val_response_length', self.config.rollout.response_length)
-            self._vllm_engine = LLM(
-                model=cache_dir,
-                tensor_parallel_size=1,
-                gpu_memory_utilization=0.8,
-                trust_remote_code=True,
-                dtype='bfloat16',
-                enforce_eager=True,
-                max_model_len=self.config.rollout.prompt_length + val_response_length,
-            )
+        logger.info(f"Initializing vLLM engine for validation from {cache_dir}...")
 
-            temperature = self.config.rollout.val_kwargs.get('temperature', 0.6)
-            top_p = self.config.rollout.val_kwargs.get('top_p', 0.95)
-            self._vllm_sampling_params = SamplingParams(
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=val_response_length,
-                detokenize=False,
-            )
-            logger.info("vLLM TP=1 initialized on cuda:0, will free GPU after validation for tandem generation")
+        val_response_length = self.config.rollout.get('val_response_length', self.config.rollout.response_length)
+        self._vllm_engine = LLM(
+            model=cache_dir,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.8,
+            trust_remote_code=True,
+            dtype='bfloat16',
+            enforce_eager=True,
+            max_model_len=self.config.rollout.prompt_length + val_response_length,
+        )
+
+        temperature = self.config.rollout.val_kwargs.get('temperature', 0.6)
+        top_p = self.config.rollout.val_kwargs.get('top_p', 0.95)
+        self._vllm_sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=val_response_length,
+            detokenize=False,
+        )
+        logger.info("vLLM engine initialized with current checkpoint weights")
 
         idx = prompts.batch["input_ids"]
         attention_mask = prompts.batch["attention_mask"]
@@ -1068,7 +1084,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         torch.cuda.synchronize()
         logger.info("vLLM engine destroyed, GPU memory freed")
 
-        response = pad_2d_list_to_length(response, self.tokenizer.pad_token_id, max_length=self.config.rollout.response_length).to(idx.device)
+        val_response_length = self.config.rollout.get('val_response_length', self.config.rollout.response_length)
+        response = pad_2d_list_to_length(response, self.tokenizer.pad_token_id, max_length=val_response_length).to(idx.device)
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
