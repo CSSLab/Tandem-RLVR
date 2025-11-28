@@ -11,9 +11,9 @@ export NCCL_P2P_LEVEL=LOC
 export NCCL_P2P_DISABLE=0
 export NCCL_SHM_DISABLE=0
 
-export WANDB_ENTITY=difanjiao
-export WANDB_PROJECT=tandem-grpo-gsm8k
-export WANDB_API_KEY=f510b3737ade928e3e94556e9fae86fcbd716dc2
+export WANDB_ENTITY=your_entity
+export WANDB_PROJECT=your_project
+export WANDB_API_KEY=your_api_key
 
 set -x
 SCRATCH_DIR=/datadrive/difan/verl-llm-tandem/scratch
