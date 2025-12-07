@@ -617,8 +617,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        # TANDEM MODIFICATION: Handle HF rollout specially
-        if rollout_config.name == "hf":
+
+        # TANDEM MODIFICATION: Skip building vLLM rollout if tandem is enabled
+        tandem_config = self.config.rollout.get("tandem", None)
+        if tandem_config and tandem_config.get("enabled", False) and tandem_config.get("use_vllm", False):
+            logger.info("TANDEM: Skipping regular vLLM rollout initialization (will use tandem vLLM instead)")
+            self.rollout = None
+        elif rollout_config.name == "hf":
             from verl.workers.rollout.hf_rollout import HFRollout
             self.rollout = HFRollout(module=self.actor_module_fsdp, config=rollout_config)
         else:
@@ -626,7 +631,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
             )
         # END TANDEM MODIFICATION
-        log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
+
+        if self.rollout is not None:
+            log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
         if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
@@ -656,6 +663,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        # Skip if using tandem (no regular rollout instance)
+        if self.rollout is None:
+            log_gpu_memory_usage("Tandem mode: offloading FSDP to CPU", logger=logger)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                if self._is_ref and hasattr(self, 'ref_module_fsdp'):
+                    offload_fsdp_model_to_cpu(self.ref_module_fsdp)
+            log_gpu_memory_usage("Tandem mode: FSDP offloaded", logger=logger)
+            return
+
         aggressive_empty_cache(force_sync=True)
 
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
@@ -699,6 +716,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_ref and hasattr(self, 'ref_module_fsdp'):
+                offload_fsdp_model_to_cpu(self.ref_module_fsdp)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
         set_expandable_segments(False)
@@ -739,7 +758,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and self.rollout is not None:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
             await self.rollout.release()
             log_gpu_memory_usage("After rollout offload", logger=logger)
@@ -767,8 +786,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
 
-        if self._is_actor or self._is_rollout:
+        tandem_vllm_rollout = (
+            self._is_rollout and
+            not self._is_actor and
+            self.config.rollout.get("tandem", {}).get("enabled", False) and
+            self.config.rollout.get("tandem", {}).get("use_vllm", False)
+        )
+
+        if (self._is_actor or self._is_rollout) and not tandem_vllm_rollout:
             # we need the model for actor and rollout
+            # EXCEPT when we're a pure rollout worker using tandem+vLLM (vLLM will load models directly)
             if self._is_actor:
                 optim_config = self.config.actor.optim
                 fsdp_config = omega_conf_to_dataclass(self.config.actor.fsdp_config)
@@ -912,7 +939,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
-        # Check if this is validation
         is_validation = prompts.meta_info.get("validate", False)
         tandem_config = self.config.rollout.get("tandem", None)
 
@@ -924,8 +950,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # For vanilla GRPO, fall through to standard vLLM rollout for validation
 
         if tandem_config is not None and tandem_config.get("enabled", False):
-            logger.info("TANDEM: Using tandem generation for training")
-            return self._tandem_generate_sequences(prompts, tandem_config)
+            use_vllm_tandem = tandem_config.get("use_vllm", True)
+            if use_vllm_tandem:
+                logger.info("TANDEM: Using vLLM tandem generation for training")
+                return self._tandem_vllm_generate_sequences(prompts, tandem_config)
+            else:
+                logger.info("TANDEM: Using HuggingFace tandem generation for training (legacy)")
+                return self._tandem_generate_sequences(prompts, tandem_config)
+
+            # # LEGACY HF TANDEM (kept for reference, use tandem.use_vllm=False to enable)
+            # logger.info("TANDEM: Using tandem generation for training")
+            # return self._tandem_generate_sequences(prompts, tandem_config)
 
         # Support all hardwares
         assert self._is_rollout
@@ -1185,6 +1220,194 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         get_torch_device().empty_cache()
         return output
+
+    def _tandem_vllm_generate_sequences(self, prompts: DataProto, tandem_config):
+        logger.info("[DEBUG] _tandem_vllm_generate_sequences entered")
+        import sys
+        import os
+        sys.path.insert(0, '/datadrive/difan/verl-llm-tandem/scratch')
+        from tandem.tandem_rollout_vllm import TandemRolloutVLLM
+
+        assert self._is_rollout
+        prompts = prompts.to(get_device_id())
+        logger.info(f"[DEBUG] prompts moved to device, batch_size={prompts.batch.batch_size[0]}")
+
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+
+        timing_generate = {}
+        logger.info("=" * 80)
+        logger.info("TANDEM vLLM: Starting _tandem_vllm_generate_sequences")
+        logger.info("=" * 80)
+
+        if self._is_actor:
+            loop = get_event_loop()
+            loop.run_until_complete(self.rollout_mode())
+            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+
+        if not hasattr(self, '_tandem_vllm_rollout_instance') or self._tandem_vllm_rollout_instance is None:
+            import torch
+            import torch.distributed as dist
+            import gc
+            import sys
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+            logger.info(f"[Rank {rank}] Initializing TandemRolloutVLLM...")
+
+            hot_model_path = self._save_hot_model_for_vllm(tandem_config)
+            frozen_model_path = tandem_config.get("frozen_model_path")
+
+            tandem_config_for_vllm = dict(tandem_config)
+            tandem_config_for_vllm['response_length'] = self.config.rollout.response_length
+
+            num_gpus = torch.cuda.device_count()
+            logger.info(f"[Rank {rank}] Worker has access to {num_gpus} GPU(s)")
+
+            # Our last solution: with fsdp_size=1, only 1 Ray worker sees both GPUs
+            # Hot model on GPU 0, Frozen model on GPU 1
+            if num_gpus >= 2:
+                tandem_config_for_vllm['gpu_a'] = 0  
+                tandem_config_for_vllm['gpu_b'] = 1  
+                tandem_config_for_vllm['gpu_memory_utilization'] = tandem_config.get('gpu_memory_utilization', 0.90)
+            else:
+                # Fallback: both on same GPU if only 1 GPU visible
+                tandem_config_for_vllm['gpu_a'] = 0
+                tandem_config_for_vllm['gpu_b'] = 0
+                tandem_config_for_vllm['gpu_memory_utilization'] = tandem_config.get('gpu_memory_utilization', 0.45)
+
+            tandem_config_for_vllm['dtype'] = 'bfloat16'
+            tandem_config_for_vllm['max_model_len'] = self.config.rollout.get('response_length', 512) + 512
+            tandem_config_for_vllm['top_p'] = self.config.rollout.get('top_p', 0.95)
+
+            logger.info(f"[Rank {rank}] TandemRolloutVLLM config: hot={hot_model_path}, frozen={frozen_model_path}")
+            logger.info(f"[Rank {rank}] Response length: {tandem_config_for_vllm['response_length']}")
+            logger.info(f"[Rank {rank}] GPU assignment: gpu_a={tandem_config_for_vllm['gpu_a']}, gpu_b={tandem_config_for_vllm['gpu_b']}")
+
+            logger.info(f"[Rank {rank}] Initializing tandem vLLM directly (in-process)...")
+            sys.path.insert(0, '/datadrive/difan/verl-llm-tandem/scratch')
+            from tandem.tandem_rollout_vllm import TandemRolloutVLLM
+
+            torch.cuda.empty_cache()
+            gc.collect()
+            log_gpu_memory_usage(f"[Rank {rank}] Before tandem vLLM init", logger=logger)
+
+            self._tandem_vllm_rollout_instance = TandemRolloutVLLM(
+                hot_model_path,
+                frozen_model_path,
+                self.tokenizer,
+                tandem_config_for_vllm
+            )
+            logger.info(f"[Rank {rank}] Tandem vLLM initialized with prob_a={tandem_config.get('prob_a', 0.5)}")
+        else:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            logger.info(f"[Rank {rank}] Updating hot model weights for vLLM tandem...")
+            hot_model_path = self._save_hot_model_for_vllm(tandem_config)
+            logger.info(f"[Rank {rank}] Hot model updated at: {hot_model_path}")
+
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        with simple_timer("generate_sequences", timing_generate):
+            output = self._tandem_vllm_rollout_instance.generate_sequences(prompts)
+        logger.info(f"[Rank {rank}] Tandem generation complete")
+
+        # Destroy vLLM instances to free GPU memory for training
+        logger.info(f"[Rank {rank}] Destroying tandem vLLM instances to free GPU memory")
+        del self._tandem_vllm_rollout_instance
+        self._tandem_vllm_rollout_instance = None
+        import torch
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage(f"[Rank {rank}] After destroying tandem vLLM", logger=logger)
+
+        if self._is_actor:
+            loop.run_until_complete(self.trainer_mode())
+            log_gpu_memory_usage("After switch to trainer mode", logger=logger)
+
+        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+            timing_generate["generate_sequences"]
+        )
+        timing_generate = reduce_timing(timing_generate)
+        timing_generate.update(
+            {
+                "generation_timing/max": timing_generate_max,
+                "generation_timing/min": timing_generate_min,
+                "generation_timing/topk_ratio": timing_generate_topk_ratio,
+            }
+        )
+        output.meta_info["timing"] = timing_generate
+        output = output.to("cpu")
+
+        get_torch_device().empty_cache()
+        return output
+
+    def _save_hot_model_for_vllm(self, tandem_config):
+        import torch
+        import os
+        from transformers import AutoModelForCausalLM
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        import torch.distributed as dist
+
+        checkpoint_dir = tandem_config.get('hot_model_checkpoint_dir', '/datadrive/difan/verl-llm-tandem/scratch/tandem_hot_model_tmp')
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        if hasattr(self, '_tandem_vllm_hot_model_path'):
+            logger.info(f"[Rank {rank}] Hot model already saved at: {self._tandem_vllm_hot_model_path}")
+        else:
+            logger.info(f"[Rank {rank}] Saving hot model checkpoint for vLLM...")
+            fsdp_model = self.rollout.module if hasattr(self.rollout, 'module') else self.actor_module_fsdp
+
+            if not isinstance(fsdp_model, FSDP):
+                logger.info(f"[Rank {rank}] Model is not FSDP, using model path directly")
+                self._tandem_vllm_hot_model_path = self.config.model.path
+                return self._tandem_vllm_hot_model_path
+
+            from verl.utils.fsdp_utils import get_fsdp_full_state_dict, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+
+            logger.info(f"[Rank {rank}] Extracting FSDP state dict for hot model...")
+            load_fsdp_model_to_gpu(fsdp_model)
+            state_dict = get_fsdp_full_state_dict(fsdp_model, offload_to_cpu=True, rank0_only=True)
+            offload_fsdp_model_to_cpu(fsdp_model)
+
+            # Only rank 0 saves the checkpoint to avoid race condition
+            if rank == 0:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+
+                logger.info(f"[Rank 0] Loading base model from {self.config.model.path} and applying FSDP weights...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.config.model.path,
+                    torch_dtype=torch.bfloat16,
+                    device_map='cpu',
+                    trust_remote_code=True
+                )
+                model.load_state_dict(state_dict, strict=True)
+
+                logger.info(f"[Rank 0] Saving hot model to {checkpoint_dir}...")
+                model.save_pretrained(checkpoint_dir, safe_serialization=True, max_shard_size="10GB")
+                self.tokenizer.save_pretrained(checkpoint_dir)
+
+                del model
+                del state_dict
+                torch.cuda.empty_cache()
+                logger.info(f"[Rank 0] Hot model saved successfully and memory cleared")
+
+            # Synchronize all ranks to ensure rank 0 finishes saving before others proceed
+            if dist.is_initialized():
+                dist.barrier()
+                logger.info(f"[Rank {rank}] Passed barrier, checkpoint ready")
+
+            self._tandem_vllm_hot_model_path = checkpoint_dir
+
+        return self._tandem_vllm_hot_model_path
 
     def _update_hot_model_weights_from_fsdp(self):
         """Update the cached hot model's weights from the FSDP model after training."""
