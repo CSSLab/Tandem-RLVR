@@ -12,7 +12,7 @@ class TandemRolloutVLLM:
         self.config = config
         self.prob_a = config.get("prob_a", 0.5)
 
-        gpu_memory_util = config.get("gpu_memory_utilization", 0.45)
+        gpu_memory_util = config.get("gpu_memory_utilization", 0.85)
         dtype = config.get("dtype", "bfloat16")
         gpu_a = config.get("gpu_a", 0)
         gpu_b = config.get("gpu_b", 1)

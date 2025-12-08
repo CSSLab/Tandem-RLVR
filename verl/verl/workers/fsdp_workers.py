@@ -1021,19 +1021,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if hasattr(self, '_tandem_rollout_instance'):
             self._update_hot_model_weights_from_fsdp()
 
-        # Use persistent cache directory instead of temp
         cache_dir = "/datadrive/difan/verl-llm-tandem/cache/vllm_validation"
 
-        # Save updated model to cache before each validation
-        if hasattr(self, '_hot_model_cache'):
-            if dist.get_rank() == 0:
-                os.makedirs(cache_dir, exist_ok=True)
-                logger.info(f"Saving hot model to {cache_dir} for vLLM...")
-                self._hot_model_cache.save_pretrained(cache_dir)
-                self.tokenizer.save_pretrained(cache_dir)
-        else:
-            logger.info("No hot model cache found, using model path from config")
-            cache_dir = self.config.model.path
+        if self._is_offload_param:
+            from verl.utils.fsdp_utils import load_fsdp_model_to_gpu
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        from verl.utils.fsdp_utils import get_fsdp_full_state_dict
+        from accelerate import init_empty_weights
+        from transformers import AutoModelForCausalLM
+
+        state_dict = get_fsdp_full_state_dict(self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True)
+
+        if dist.get_rank() == 0:
+            os.makedirs(cache_dir, exist_ok=True)
+            logger.info(f"Saving current FSDP actor weights to {cache_dir} for vLLM validation...")
+
+            with init_empty_weights():
+                save_model = AutoModelForCausalLM.from_config(self.actor_model_config, torch_dtype=torch.bfloat16)
+            save_model.to_empty(device="cpu")
+            save_model.save_pretrained(cache_dir, state_dict=state_dict)
+            self.tokenizer.save_pretrained(cache_dir)
+            del save_model
 
         dist.barrier()
 

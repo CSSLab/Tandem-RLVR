@@ -26,7 +26,7 @@ B=8
 VAL_B=1024
 N=16
 L=512
-VAL_L=1280
+VAL_L=1024
 MODEL_NAME=Qwen/Qwen3-0.6B
 NAME=tandem_vllm_grpo_gsm8k_Qwen3-0.6B
 
@@ -94,10 +94,10 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     trainer.test_freq=1 \
     trainer.total_epochs=2 \
     +ray_init.num_cpus=16 \
-    trainer.val_before_train=True \
-    trainer.log_val_generations=$VAL_B \
+    trainer.val_before_train=False \
+    trainer.log_val_generations=10 \
     trainer.resume_mode='auto' \
-    trainer.max_actor_ckpt_to_keep=1 \
+    trainer.max_actor_ckpt_to_keep=10 \
     trainer.max_critic_ckpt_to_keep=1 \
-    +trainer.start_save_step=20 \
+    +trainer.start_save_step=10 \
     $@
