@@ -2,6 +2,7 @@
 
 import copy
 import time
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
@@ -9,6 +10,9 @@ from torch import nn
 
 from vllm.attention import Attention
 from vllm.config import TandemConfig, VllmConfig, get_layers_from_vllm_config
+from vllm.distributed.parallel_state import (
+    get_frozen_tp_group, get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size, use_frozen_tp)
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 
@@ -19,6 +23,12 @@ FROZEN_PREFIX = "tandem_frozen."
 
 def is_frozen_layer(layer_name: str) -> bool:
     return layer_name.startswith(FROZEN_PREFIX)
+
+
+def _frozen_tp_context():
+    if get_frozen_tp_group() is not None:
+        return use_frozen_tp()
+    return nullcontext()
 
 
 class TandemModelManager:
@@ -47,23 +57,28 @@ class TandemModelManager:
 
         return frozen_config
 
+    def _resolve_frozen_device(self) -> torch.device:
+        tc = self.tandem_config
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        if tc.frozen_gpu_devices:
+            device_id = tc.frozen_gpu_devices[tp_rank]
+        else:
+            device_id = tp_rank + tp_size
+
+        return torch.device(f"cuda:{device_id}")
+
     def load_frozen_model(self) -> None:
         tc = self.tandem_config
         if not tc.enabled:
             return
 
-        if tc.frozen_gpu_devices:
-            device_id = tc.frozen_gpu_devices[0]
-        else:
-            primary_device = self.primary_vllm_config.device_config.device
-            if hasattr(primary_device, 'index') and primary_device.index is not None:
-                device_id = primary_device.index + 1
-            else:
-                device_id = 1
-        self.frozen_device = torch.device(f"cuda:{device_id}")
+        self.frozen_device = self._resolve_frozen_device()
 
-        logger.info("Loading frozen tandem model %s on %s...",
-                     tc.frozen_model, self.frozen_device)
+        logger.info("Loading frozen tandem model %s on %s (TP rank %d)...",
+                     tc.frozen_model, self.frozen_device,
+                     get_tensor_model_parallel_rank())
 
         frozen_vllm_config = self._build_frozen_vllm_config()
 
@@ -76,10 +91,11 @@ class TandemModelManager:
         time_before = time.perf_counter()
         with set_default_torch_dtype(frozen_vllm_config.model_config.dtype):
             with torch.device(self.frozen_device):
-                self.frozen_model = _initialize_model(
-                    vllm_config=frozen_vllm_config,
-                    prefix=FROZEN_PREFIX,
-                )
+                with _frozen_tp_context():
+                    self.frozen_model = _initialize_model(
+                        vllm_config=frozen_vllm_config,
+                        prefix=FROZEN_PREFIX,
+                    )
 
             self.frozen_model.load_weights(
                 loader.get_all_weights(
@@ -155,18 +171,20 @@ class TandemModelManager:
 
         frozen_attn_metadata = self._adapt_attn_metadata(attn_metadata)
 
-        with set_forward_context(frozen_attn_metadata, self.primary_vllm_config):
-            hidden_states = self.frozen_model(
-                input_ids=frozen_input_ids,
-                positions=frozen_positions,
-                intermediate_tensors=None,
-                inputs_embeds=None,
-            )
+        with _frozen_tp_context():
+            with set_forward_context(frozen_attn_metadata,
+                                     self.primary_vllm_config):
+                hidden_states = self.frozen_model(
+                    input_ids=frozen_input_ids,
+                    positions=frozen_positions,
+                    intermediate_tensors=None,
+                    inputs_embeds=None,
+                )
 
-        hidden_states = hidden_states[:num_scheduled_tokens]
-        sample_hidden_states = hidden_states[frozen_logits_indices]
-        frozen_logits = self.frozen_model.compute_logits(
-            sample_hidden_states, None)
+            hidden_states = hidden_states[:num_scheduled_tokens]
+            sample_hidden_states = hidden_states[frozen_logits_indices]
+            frozen_logits = self.frozen_model.compute_logits(
+                sample_hidden_states, None)
 
         return frozen_logits
 

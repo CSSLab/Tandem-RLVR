@@ -797,6 +797,8 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 
+_FROZEN_TP: Optional[GroupCoordinator] = None
+
 
 def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, ("tensor model parallel group is not initialized")
@@ -805,6 +807,53 @@ def get_tp_group() -> GroupCoordinator:
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
+
+
+def initialize_frozen_model_parallel(
+    frozen_local_rank: int,
+    backend: Optional[str] = None,
+) -> None:
+    global _FROZEN_TP
+    assert _FROZEN_TP is None, (
+        "frozen tensor model parallel group is already initialized")
+
+    backend = backend or torch.distributed.get_backend(
+        get_world_group().device_group)
+
+    tp = get_tp_group()
+    world_size = torch.distributed.get_world_size()
+    tp_size = tp.world_size
+    num_groups = world_size // tp_size
+
+    all_group_ranks = [
+        list(range(i * tp_size, (i + 1) * tp_size))
+        for i in range(num_groups)
+    ]
+
+    _FROZEN_TP = init_model_parallel_group(
+        group_ranks=all_group_ranks,
+        local_rank=frozen_local_rank,
+        backend=backend,
+        group_name="frozen_tp",
+    )
+
+
+def get_frozen_tp_group() -> Optional[GroupCoordinator]:
+    return _FROZEN_TP
+
+
+@contextmanager
+def use_frozen_tp():
+    global _TP
+    assert _FROZEN_TP is not None, (
+        "frozen tensor model parallel group is not initialized")
+    old_tp = _TP
+    _TP = _FROZEN_TP
+    try:
+        yield _FROZEN_TP
+    finally:
+        _TP = old_tp
+
 
 _PP: Optional[GroupCoordinator] = None
 
@@ -1080,6 +1129,11 @@ def get_tensor_model_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    global _FROZEN_TP
+    if _FROZEN_TP:
+        _FROZEN_TP.destroy()
+    _FROZEN_TP = None
+
     global _TP
     if _TP:
         _TP.destroy()

@@ -326,6 +326,21 @@ def init_worker_distributed_environment(
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
+    # [MODIFIED 2026-03-13 tandem frozen TP group initialization]
+    tandem_config = vllm_config.tandem_config
+    if tandem_config is not None and tandem_config.enabled:
+        from vllm.distributed.parallel_state import (
+            get_frozen_tp_group, get_tensor_model_parallel_rank,
+            initialize_frozen_model_parallel)
+        if get_frozen_tp_group() is None:
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = parallel_config.tensor_parallel_size
+            if tandem_config.frozen_gpu_devices:
+                frozen_local_rank = tandem_config.frozen_gpu_devices[tp_rank]
+            else:
+                frozen_local_rank = local_rank + tp_size
+            initialize_frozen_model_parallel(frozen_local_rank)
+
     ensure_kv_transfer_initialized(vllm_config)
 
 

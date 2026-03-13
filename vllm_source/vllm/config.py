@@ -3694,6 +3694,29 @@ class TandemConfig:
         if self.selection_strategy not in ("bernoulli", "chunk", "alternating"):
             raise ValueError(
                 f"Invalid selection_strategy: {self.selection_strategy}")
+        if self.target_parallel_config is not None and self.enabled:
+            self._validate_parallelism()
+
+    def _validate_parallelism(self):
+        pc = self.target_parallel_config
+        primary_tp = pc.tensor_parallel_size
+        if self.frozen_tensor_parallel_size == 1 and primary_tp > 1:
+            self.frozen_tensor_parallel_size = primary_tp
+        if self.frozen_tensor_parallel_size != primary_tp:
+            raise ValueError(
+                f"frozen_tensor_parallel_size "
+                f"({self.frozen_tensor_parallel_size}) must match primary "
+                f"tensor_parallel_size ({primary_tp})")
+        if self.frozen_gpu_devices is not None:
+            if len(self.frozen_gpu_devices) != primary_tp:
+                raise ValueError(
+                    f"frozen_gpu_devices length "
+                    f"({len(self.frozen_gpu_devices)}) must match "
+                    f"tensor_parallel_size ({primary_tp})")
+        if pc.pipeline_parallel_size > 1:
+            raise ValueError(
+                "Tandem generation does not support pipeline "
+                "parallelism (pp > 1)")
 
     @classmethod
     def from_dict(cls, dict_value: dict) -> "TandemConfig":

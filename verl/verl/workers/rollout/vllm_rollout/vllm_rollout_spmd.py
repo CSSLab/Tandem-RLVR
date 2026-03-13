@@ -392,6 +392,8 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
+            # [MODIFIED 2026-03-12 tandem model_mask extraction]
+            tandem_model_masks = []
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
@@ -401,6 +403,10 @@ class vLLMRollout(BaseRollout):
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
+                    # [MODIFIED 2026-03-12 tandem model_mask extraction]
+                    mask = getattr(output.outputs[sample_id], 'tandem_model_mask', None)
+                    if mask is not None:
+                        tandem_model_masks.append(mask)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
@@ -442,8 +448,13 @@ class vLLMRollout(BaseRollout):
             batch_size=batch_size,
         )
         if self.config.calculate_log_probs:
-            # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+
+        # [MODIFIED 2026-03-12 tandem model_mask into DataProto batch]
+        if tandem_model_masks:
+            batch["model_mask"] = pad_2d_list_to_length(
+                tandem_model_masks, 0, max_length=self.config.response_length
+            ).to(idx.device).to(torch.float32)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
