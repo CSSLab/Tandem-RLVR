@@ -49,3 +49,13 @@ thumbs.db   # Windows
 scratch/
 archive/
 cache/
+
+# vllm source — binary artifacts (keep .py files tracked)
+vllm_source/vllm/*.so
+vllm_source/vllm/**/*.so
+vllm_source/vllm/__pycache__/
+vllm_source/vllm/**/__pycache__/
+verl/run_tandem_grpo_gsm8k.sh
+verl/run_tandem_grpo_gsm8k_sft.sh
+verl/run_tandem_vllm_grpo_gsm8k.sh
+verl/run_tandem_self_step30.sh

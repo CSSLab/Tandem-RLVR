@@ -377,6 +377,11 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        # [MODIFIED 2026-03-13 tandem loss masking needs model_mask/model_a_mask]
+        for tandem_key in ("model_mask", "model_a_mask"):
+            if tandem_key in data.batch.keys():
+                select_keys.append(tandem_key)
+                break
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -411,31 +416,25 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
-                    # TANDEM MODIFICATION: Apply model_a_mask to weight hot vs frozen tokens
-                    if "model_a_mask" in model_inputs.keys():
-                        model_a_mask = model_inputs["model_a_mask"]
+                    # [MODIFIED 2026-03-13 tandem loss masking: model_mask from vLLM-native pipeline]
+                    tandem_mask_key = None
+                    if "model_mask" in model_inputs:
+                        tandem_mask_key = "model_mask"
+                    elif "model_a_mask" in model_inputs:
+                        tandem_mask_key = "model_a_mask"
 
-                        # Option 1: Zero out frozen tokens completely (conservative)
-                        # response_mask = response_mask * model_a_mask
-
-                        # Option 2: Weight frozen tokens with jr_tkn_weight (from original tandem)
-                        # Hot tokens: full weight (1.0), Frozen tokens: reduced weight (0.2)
-                        # This helps hot model learn to predict/understand frozen model's outputs
+                    if tandem_mask_key is not None:
+                        tandem_mask = model_inputs[tandem_mask_key]
                         jr_tkn_weight = self.config.get("tandem_jr_tkn_weight", 0.0)
                         if jr_tkn_weight > 0:
-                            # Weighted combination: hot_mask * 1.0 + frozen_mask * jr_tkn_weight
-                            weighted_mask = model_a_mask.float() * 1.0 + (~model_a_mask.bool()).float() * jr_tkn_weight
-                            response_mask = response_mask * weighted_mask
+                            weighted = tandem_mask.float() + (~tandem_mask.bool()).float() * jr_tkn_weight
+                            response_mask = response_mask * weighted
                         else:
-                            # Default: zero out frozen tokens
-                            response_mask = response_mask * model_a_mask
-
+                            response_mask = response_mask * tandem_mask
                         model_inputs["response_mask"] = response_mask
-
-                        # Note: neg_weight from original tandem is NOT applicable to GRPO
-                        # GRPO uses all samples (positive and negative advantages) equally
-                        # The advantage normalization handles good vs bad samples automatically
-                    # END TANDEM MODIFICATION
+                        primary_frac = tandem_mask.float().mean().item()
+                        micro_batch_metrics["tandem/primary_token_fraction"] = primary_frac
+                        micro_batch_metrics["tandem/frozen_token_fraction"] = 1.0 - primary_frac
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode

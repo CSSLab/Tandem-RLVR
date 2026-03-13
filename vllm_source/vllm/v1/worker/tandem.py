@@ -55,6 +55,8 @@ class TandemModelManager:
         if tc.frozen_max_model_len:
             frozen_config.model_config.max_model_len = tc.frozen_max_model_len
 
+        frozen_config.load_config.load_format = "auto"
+
         return frozen_config
 
     def _resolve_frozen_device(self) -> torch.device:

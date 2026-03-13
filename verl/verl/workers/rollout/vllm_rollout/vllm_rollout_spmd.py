@@ -45,7 +45,7 @@ import torch.distributed
 import zmq
 import zmq.asyncio
 from filelock import FileLock
-from omegaconf import ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
@@ -210,6 +210,10 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        # [MODIFIED 2026-03-13 convert OmegaConf tandem_config to plain dict for vLLM]
+        if "tandem_config" in engine_kwargs and isinstance(engine_kwargs["tandem_config"], DictConfig):
+            engine_kwargs["tandem_config"] = OmegaConf.to_container(
+                engine_kwargs["tandem_config"], resolve=True)
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
