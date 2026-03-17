@@ -425,6 +425,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if tandem_mask_key is not None:
                         tandem_mask = model_inputs[tandem_mask_key]
+                        orig_response_mask = response_mask
                         jr_tkn_weight = self.config.get("tandem_jr_tkn_weight", 0.0)
                         if jr_tkn_weight > 0:
                             weighted = tandem_mask.float() + (~tandem_mask.bool()).float() * jr_tkn_weight
@@ -432,7 +433,12 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             response_mask = response_mask * tandem_mask
                         model_inputs["response_mask"] = response_mask
-                        primary_frac = tandem_mask.float().mean().item()
+                        real_token_count = orig_response_mask.sum()
+                        if real_token_count > 0:
+                            primary_frac = (tandem_mask.float() * orig_response_mask).sum() / real_token_count
+                            primary_frac = primary_frac.item()
+                        else:
+                            primary_frac = 0.5
                         micro_batch_metrics["tandem/primary_token_fraction"] = primary_frac
                         micro_batch_metrics["tandem/frozen_token_fraction"] = 1.0 - primary_frac
 

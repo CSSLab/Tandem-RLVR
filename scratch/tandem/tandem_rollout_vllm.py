@@ -198,7 +198,7 @@ if __name__ == "__main__":
         "In mathematics, a prime number is"
     ]
 
-    response_length = 256
+    response_length = 512
 
     input_ids_list = []
     attention_mask_list = []

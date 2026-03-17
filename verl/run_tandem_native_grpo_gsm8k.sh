@@ -20,11 +20,11 @@ export WANDB_API_KEY=f510b3737ade928e3e94556e9fae86fcbd716dc2
 set -x
 SCRATCH_DIR=/datadrive/difan/verl-llm-tandem/scratch
 
-B=8
+B=32
 VAL_B=512
 N=8
-L=512
-VAL_L=512
+L=1024
+VAL_L=1024
 MODEL_NAME=Qwen/Qwen3-0.6B
 NAME=tandem_native_grpo_gsm8k_Qwen3-0.6B
 
@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     +actor_rollout_ref.rollout.val_response_length=$VAL_L \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.enforce_eager=True \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.enabled=True \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.frozen_model=${MODEL_NAME} \

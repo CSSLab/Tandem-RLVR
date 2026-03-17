@@ -1369,54 +1369,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         rank = dist.get_rank() if dist.is_initialized() else 0
 
-        if hasattr(self, '_tandem_vllm_hot_model_path'):
-            logger.info(f"[Rank {rank}] Hot model already saved at: {self._tandem_vllm_hot_model_path}")
-        else:
-            logger.info(f"[Rank {rank}] Saving hot model checkpoint for vLLM...")
-            fsdp_model = self.rollout.module if hasattr(self.rollout, 'module') else self.actor_module_fsdp
+        logger.info(f"[Rank {rank}] Saving hot model checkpoint for vLLM to {checkpoint_dir}...")
+        fsdp_model = self.rollout.module if hasattr(self.rollout, 'module') else self.actor_module_fsdp
 
-            if not isinstance(fsdp_model, FSDP):
-                logger.info(f"[Rank {rank}] Model is not FSDP, using model path directly")
-                self._tandem_vllm_hot_model_path = self.config.model.path
-                return self._tandem_vllm_hot_model_path
+        if not isinstance(fsdp_model, FSDP):
+            logger.info(f"[Rank {rank}] Model is not FSDP, using model path directly")
+            return self.config.model.path
 
-            from verl.utils.fsdp_utils import get_fsdp_full_state_dict, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+        from verl.utils.fsdp_utils import get_fsdp_full_state_dict, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 
-            logger.info(f"[Rank {rank}] Extracting FSDP state dict for hot model...")
-            load_fsdp_model_to_gpu(fsdp_model)
-            state_dict = get_fsdp_full_state_dict(fsdp_model, offload_to_cpu=True, rank0_only=True)
-            offload_fsdp_model_to_cpu(fsdp_model)
+        logger.info(f"[Rank {rank}] Extracting FSDP state dict for hot model...")
+        load_fsdp_model_to_gpu(fsdp_model)
+        state_dict = get_fsdp_full_state_dict(fsdp_model, offload_to_cpu=True, rank0_only=True)
+        offload_fsdp_model_to_cpu(fsdp_model)
 
-            # Only rank 0 saves the checkpoint to avoid race condition
-            if rank == 0:
-                os.makedirs(checkpoint_dir, exist_ok=True)
+        if rank == 0:
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
-                logger.info(f"[Rank 0] Loading base model from {self.config.model.path} and applying FSDP weights...")
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.config.model.path,
-                    torch_dtype=torch.bfloat16,
-                    device_map='cpu',
-                    trust_remote_code=True
-                )
-                model.load_state_dict(state_dict, strict=True)
+            logger.info(f"[Rank 0] Loading base model from {self.config.model.path} and applying FSDP weights...")
+            model = AutoModelForCausalLM.from_pretrained(
+                self.config.model.path,
+                torch_dtype=torch.bfloat16,
+                device_map='cpu',
+                trust_remote_code=True
+            )
+            model.load_state_dict(state_dict, strict=True)
 
-                logger.info(f"[Rank 0] Saving hot model to {checkpoint_dir}...")
-                model.save_pretrained(checkpoint_dir, safe_serialization=True, max_shard_size="10GB")
-                self.tokenizer.save_pretrained(checkpoint_dir)
+            logger.info(f"[Rank 0] Saving hot model to {checkpoint_dir}...")
+            model.save_pretrained(checkpoint_dir, safe_serialization=True, max_shard_size="10GB")
+            self.tokenizer.save_pretrained(checkpoint_dir)
 
-                del model
-                del state_dict
-                torch.cuda.empty_cache()
-                logger.info(f"[Rank 0] Hot model saved successfully and memory cleared")
+            del model
+            del state_dict
+            torch.cuda.empty_cache()
+            logger.info(f"[Rank 0] Hot model saved successfully and memory cleared")
 
-            # Synchronize all ranks to ensure rank 0 finishes saving before others proceed
-            if dist.is_initialized():
-                dist.barrier()
-                logger.info(f"[Rank {rank}] Passed barrier, checkpoint ready")
+        if dist.is_initialized():
+            dist.barrier()
+            logger.info(f"[Rank {rank}] Passed barrier, checkpoint ready")
 
-            self._tandem_vllm_hot_model_path = checkpoint_dir
-
-        return self._tandem_vllm_hot_model_path
+        return checkpoint_dir
 
     def _update_hot_model_weights_from_fsdp(self):
         """Update the cached hot model's weights from the FSDP model after training."""
