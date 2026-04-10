@@ -214,6 +214,17 @@ class vLLMRollout(BaseRollout):
         if "tandem_config" in engine_kwargs and isinstance(engine_kwargs["tandem_config"], DictConfig):
             engine_kwargs["tandem_config"] = OmegaConf.to_container(
                 engine_kwargs["tandem_config"], resolve=True)
+        # [MODIFIED 2026-04-04 auto-resolve boundary_token_ids for sentence strategy]
+        if "tandem_config" in engine_kwargs:
+            tc = engine_kwargs["tandem_config"]
+            if tc.get("selection_strategy") == "sentence" and not tc.get("boundary_token_ids"):
+                from transformers import AutoTokenizer as _AT
+                _tok = _AT.from_pretrained(model_path, trust_remote_code=True)
+                _ids = set()
+                for ch in [".", "?", "\n"]:
+                    _ids.update(_tok.encode(ch, add_special_tokens=False))
+                tc["boundary_token_ids"] = sorted(_ids)
+                logger.info(f"Tandem sentence strategy: auto-resolved boundary_token_ids={tc['boundary_token_ids']}")
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 

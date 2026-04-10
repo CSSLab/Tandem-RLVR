@@ -70,7 +70,14 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
         AttributeError: If the specified function name isn't found in the module.
     """
 
-    reward_fn_config = config.get("custom_reward_function") or {}
+    # [MODIFIED 2026-04-09 custom_reward_function lives under reward_model in trainer config,
+    #  not at the top level; fall back to top-level for callers that pass a subtree directly]
+    _rm = getattr(config, 'reward_model', None)
+    reward_fn_config = (
+        config.get("custom_reward_function")
+        or (_rm.get("custom_reward_function") if _rm is not None else None)
+        or {}
+    )
     file_path = reward_fn_config.get("path")
     if not file_path:
         return None

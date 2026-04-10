@@ -49,6 +49,11 @@ def default_compute_score(
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)
+    # [MODIFIED 2026-04-09 add hendrycks_math training data source]
+    elif data_source == "EleutherAI/hendrycks_math":
+        from . import math_dataset
+
+        res = math_dataset.compute_score(solution_str, ground_truth)
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.

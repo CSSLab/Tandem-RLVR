@@ -50,6 +50,17 @@ class TandemModelManager:
             frozen_config.model_config.model = tc.frozen_model
             if tc.frozen_model_revision:
                 frozen_config.model_config.revision = tc.frozen_model_revision
+            # [MODIFIED 2026-04-03 reload hf_config for different-architecture frozen models]
+            from vllm.transformers_utils.config import (get_config,
+                                                        get_hf_text_config)
+            frozen_hf_config = get_config(
+                tc.frozen_model,
+                trust_remote_code=frozen_config.model_config.trust_remote_code,
+                revision=tc.frozen_model_revision,
+            )
+            frozen_config.model_config.hf_config = frozen_hf_config
+            frozen_config.model_config.hf_text_config = get_hf_text_config(
+                frozen_hf_config)
         if tc.frozen_quantization:
             frozen_config.model_config.quantization = tc.frozen_quantization
         if tc.frozen_max_model_len:

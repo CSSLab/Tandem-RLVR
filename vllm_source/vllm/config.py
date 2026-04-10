@@ -3659,7 +3659,9 @@ class CompilationConfig(BaseModel):
             ]
 
 
-TandemSelectionStrategy = Literal["bernoulli", "chunk", "alternating"]
+# [MODIFIED 2026-04-03 add sentence strategy for boundary-based model switching]
+# TandemSelectionStrategy = Literal["bernoulli", "chunk", "alternating"]
+TandemSelectionStrategy = Literal["bernoulli", "chunk", "alternating", "sentence"]
 
 
 @dataclass
@@ -3678,6 +3680,8 @@ class TandemConfig:
     frozen_quantization: Optional[str] = None
     frozen_enforce_eager: Optional[bool] = None
     frozen_max_model_len: Optional[int] = None
+    # [MODIFIED 2026-04-03 boundary token IDs for sentence-level model switching]
+    boundary_token_ids: Optional[list[int]] = None
 
     target_model_config: ModelConfig = field(default=None,
                                              init=True)  # type: ignore
@@ -3691,9 +3695,15 @@ class TandemConfig:
         if not 0.0 <= self.prob_primary <= 1.0:
             raise ValueError(
                 f"prob_primary must be in [0, 1], got {self.prob_primary}")
-        if self.selection_strategy not in ("bernoulli", "chunk", "alternating"):
+        # [MODIFIED 2026-04-03 add sentence to valid strategies]
+        # if self.selection_strategy not in ("bernoulli", "chunk", "alternating"):
+        if self.selection_strategy not in (
+                "bernoulli", "chunk", "alternating", "sentence"):
             raise ValueError(
                 f"Invalid selection_strategy: {self.selection_strategy}")
+        if self.selection_strategy == "sentence" and not self.boundary_token_ids:
+            raise ValueError(
+                "boundary_token_ids required for sentence strategy")
         if self.target_parallel_config is not None and self.enabled:
             self._validate_parallelism()
 

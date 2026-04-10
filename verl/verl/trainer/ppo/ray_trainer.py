@@ -343,6 +343,10 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        # [MODIFIED 2026-03-17 best-model tracking for HF checkpoint export]
+        self._best_val_score = -float("inf")
+        self._best_val_step = -1
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -838,6 +842,52 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    # [MODIFIED 2026-03-17 save best HF checkpoint during training]
+    def _maybe_save_best_hf_checkpoint(self, val_metrics: dict):
+        best_ckpt_dir = self.config.trainer.get("best_hf_checkpoint_dir", None)
+        if best_ckpt_dir is None:
+            return
+        best_metric_key = self.config.trainer.get(
+            "best_hf_metric_key", None)
+        if best_metric_key is None:
+            for k in val_metrics:
+                if "val-core" in k and "reward" in k and "mean@1" in k:
+                    best_metric_key = k
+                    break
+        if best_metric_key is None or best_metric_key not in val_metrics:
+            return
+        score = val_metrics[best_metric_key]
+        if score <= self._best_val_score:
+            return
+        self._best_val_score = score
+        self._best_val_step = self.global_steps
+        print(f"New best val score: {score:.4f} at step {self.global_steps} ({best_metric_key})")
+        tmp_ckpt_dir = os.path.join(
+            self.config.trainer.default_local_dir,
+            f"global_step_{self.global_steps}", "actor")
+        if not os.path.exists(tmp_ckpt_dir):
+            self.actor_rollout_wg.save_checkpoint(tmp_ckpt_dir, None, self.global_steps)
+        from verl.model_merger.base_model_merger import ModelMergerConfig
+        from verl.model_merger.fsdp_model_merger import FSDPModelMerger
+        merge_config = ModelMergerConfig(
+            operation="merge",
+            backend="fsdp",
+            local_dir=tmp_ckpt_dir,
+            target_dir=best_ckpt_dir,
+            hf_model_config_path=os.path.join(tmp_ckpt_dir, "huggingface"),
+            trust_remote_code=True,
+        )
+        merger = FSDPModelMerger(merge_config)
+        merger.merge_and_save()
+        meta = {
+            "step": self.global_steps,
+            "metric_key": best_metric_key,
+            "score": score,
+        }
+        with open(os.path.join(best_ckpt_dir, "best_model_info.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"Best HF checkpoint saved to {best_ckpt_dir}")
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             # NOTE: while there is no checkpoint to load, we still need to offload the model and optimizer to CPU
@@ -1231,6 +1281,8 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    # [MODIFIED 2026-03-17 save best HF checkpoint if val improved]
+                    self._maybe_save_best_hf_checkpoint(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(

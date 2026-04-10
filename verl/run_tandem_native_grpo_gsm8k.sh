@@ -23,10 +23,27 @@ SCRATCH_DIR=/datadrive/difan/verl-llm-tandem/scratch
 B=32
 VAL_B=512
 N=8
-L=1024
-VAL_L=1024
-MODEL_NAME=Qwen/Qwen3-0.6B
-NAME=tandem_native_grpo_gsm8k_Qwen3-0.6B
+L=512
+VAL_L=512
+SENIOR_MODEL=${SENIOR_MODEL:-Qwen/Qwen3-4B}
+JUNIOR_MODEL=${JUNIOR_MODEL:-${SENIOR_MODEL}}
+
+# tandem selection: "bernoulli" (token-level) or "sentence" (sentence-level round-robin)
+TANDEM_STRATEGY=${TANDEM_STRATEGY:-sentence}
+
+SENIOR_TAG=$(echo ${SENIOR_MODEL} | sed 's|.*/||')
+JUNIOR_TAG=$(echo ${JUNIOR_MODEL} | sed 's|.*/||')
+if [ "$SENIOR_MODEL" = "$JUNIOR_MODEL" ]; then
+    MODEL_TAG=${SENIOR_TAG}
+else
+    MODEL_TAG=${SENIOR_TAG}_jr-${JUNIOR_TAG}
+fi
+
+if [ "$TANDEM_STRATEGY" = "sentence" ]; then
+    NAME=tandem_sentence_grpo_gsm8k_${MODEL_TAG}
+else
+    NAME=tandem_native_grpo_gsm8k_${MODEL_TAG}
+fi
 
 CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -40,7 +57,7 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     data.max_response_length=$L \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=${MODEL_NAME} \
+    actor_rollout_ref.model.path=${SENIOR_MODEL} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -70,11 +87,11 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.enforce_eager=True \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.enabled=True \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.frozen_model=${MODEL_NAME} \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.frozen_model=${JUNIOR_MODEL} \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.prob_primary=0.5 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.selection_strategy=bernoulli \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.selection_strategy=${TANDEM_STRATEGY} \
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.frozen_gpu_devices=[1]' \
-    +actor_rollout_ref.actor.tandem_jr_tkn_weight=0.2 \
+    +actor_rollout_ref.actor.tandem_jr_tkn_weight=0.15 \
     actor_rollout_ref.ref.strategy=fsdp \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.enable=False \
@@ -88,7 +105,7 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.default_local_dir=$SCRATCH_DIR/checkpoints/${NAME} \
     trainer.save_freq=10 \
-    trainer.test_freq=5 \
+    trainer.test_freq=10 \
     trainer.total_epochs=2 \
     +ray_init.num_cpus=16 \
     trainer.val_before_train=False \
@@ -97,4 +114,5 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
     +trainer.start_save_step=20 \
+    +trainer.best_hf_checkpoint_dir=$SCRATCH_DIR/hf/${NAME}/best_model \
     $@
