@@ -19,35 +19,26 @@ Per-step latency is ≈ 2× single-model vLLM. Per-file detail in [`model_spec/S
 
 ### Install (Linux, 2× A100 80GB)
 
+The full install — base image, pinned pip stack, our vLLM overlay, editable verl, and five import-smoke checks — is captured in [`Dockerfile.repro`](Dockerfile.repro). Build (~7 min from scratch, ~18 GB final image) and drop into the container:
+
 ```bash
-docker run --gpus all -it nvcr.io/nvidia/pytorch:24.08-py3 bash
-
-# Clean NGC's torch fork; install the pinned stack matching verl 0.5 + vllm 0.8.5.
-pip uninstall -y torch torchvision torchaudio pytorch-quantization pytorch-triton \
-                  torch-tensorrt xgboost transformer_engine flash_attn apex \
-                  megatron-core grpcio
-pip install vllm==0.8.5 torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
-            tensordict==0.6.2 torchdata transformers==4.57.3 accelerate datasets \
-            ray[default] codetiming hydra-core wandb dill pybind11 mathruler math-verify \
-            "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" \
-            "optree>=0.13.0" "pydantic>=2.9"
-pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
-pip install https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.2.post1/flashinfer_python-0.2.2.post1+cu124torch2.6-cp38-abi3-linux_x86_64.whl
-
-# Clone, overlay our patched vLLM Python sources on top of the installed .so kernels,
-# install our patched verl editable.
 git clone https://github.com/CSSLab/Tandem-RLVR.git && cd Tandem-RLVR
-VLLM_DIR=$(python -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null | tail -1) && cp -r vllm_source/vllm/* "$VLLM_DIR/"
-pip install -e verl
 
-# Wandb credentials (gitignored).
+# Wandb credentials (gitignored, lives only on host; bind-mounted into the container at run time)
 mkdir -p scratch && cat > scratch/wandb_secrets.env <<'EOF'
 WANDB_API_KEY=<your key>
 WANDB_ENTITY=<your entity>
 WANDB_PROJECT_TANDEM_NATIVE_GRPO_DEEPSCALER=tandem-native-grpo-deepscaler
 WANDB_PROJECT_VANILLA_GRPO_DEEPSCALER=vanilla-grpo-deepscaler
 EOF
+
+docker build -f Dockerfile.repro -t tandem-rlvr:repro .
+docker run --gpus all -it -v $(pwd)/scratch:/workspace/Tandem-RLVR/scratch \
+           -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+           tandem-rlvr:repro bash
 ```
+
+Pinned stack inside the image: Python 3.10, vLLM 0.8.5, torch 2.6.0+cu124, transformers 4.57.3, flash-attn 2.7.4.post1, flashinfer 0.2.2.post1 (full list in `Dockerfile.repro`).
 
 ## 2. Training (verl, DeepScaleR, Qwen3-4B-Instruct-2507)
 
