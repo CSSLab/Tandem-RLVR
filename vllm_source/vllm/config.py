@@ -3660,8 +3660,10 @@ class CompilationConfig(BaseModel):
 
 
 # [MODIFIED 2026-04-03 add sentence strategy for boundary-based model switching]
+# [MODIFIED 2026-04-24 add word strategy: Ġ-prefix boundaries + max-gap fallback]
 # TandemSelectionStrategy = Literal["bernoulli", "chunk", "alternating"]
-TandemSelectionStrategy = Literal["bernoulli", "chunk", "alternating", "sentence"]
+# TandemSelectionStrategy = Literal["bernoulli", "chunk", "alternating", "sentence"]
+TandemSelectionStrategy = Literal["bernoulli", "chunk", "alternating", "sentence", "word"]
 
 
 @dataclass
@@ -3682,6 +3684,12 @@ class TandemConfig:
     frozen_max_model_len: Optional[int] = None
     # [MODIFIED 2026-04-03 boundary token IDs for sentence-level model switching]
     boundary_token_ids: Optional[list[int]] = None
+    # [MODIFIED 2026-04-16 chunk_size for chunk strategy: each model generates
+    # this many consecutive tokens before switching; 1 = per-token alternation]
+    chunk_size: int = 1
+    # [MODIFIED 2026-04-24 max_gap_tokens for word strategy: force a switch after
+    # this many tokens with no boundary (atomic-unit escape hatch)]
+    max_gap_tokens: int = 32
 
     target_model_config: ModelConfig = field(default=None,
                                              init=True)  # type: ignore
@@ -3696,14 +3704,20 @@ class TandemConfig:
             raise ValueError(
                 f"prob_primary must be in [0, 1], got {self.prob_primary}")
         # [MODIFIED 2026-04-03 add sentence to valid strategies]
+        # [MODIFIED 2026-04-24 add word to valid strategies]
         # if self.selection_strategy not in ("bernoulli", "chunk", "alternating"):
+        # if self.selection_strategy not in (
+        #         "bernoulli", "chunk", "alternating", "sentence"):
         if self.selection_strategy not in (
-                "bernoulli", "chunk", "alternating", "sentence"):
+                "bernoulli", "chunk", "alternating", "sentence", "word"):
             raise ValueError(
                 f"Invalid selection_strategy: {self.selection_strategy}")
-        if self.selection_strategy == "sentence" and not self.boundary_token_ids:
+        if self.selection_strategy in ("sentence", "word") and not self.boundary_token_ids:
             raise ValueError(
-                "boundary_token_ids required for sentence strategy")
+                f"boundary_token_ids required for {self.selection_strategy} strategy")
+        if self.selection_strategy == "word" and self.max_gap_tokens < 1:
+            raise ValueError(
+                f"max_gap_tokens must be >= 1 for word strategy, got {self.max_gap_tokens}")
         if self.target_parallel_config is not None and self.enabled:
             self._validate_parallelism()
 
