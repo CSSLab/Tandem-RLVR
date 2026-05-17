@@ -1,0 +1,53 @@
+# Reproduction image for the README install instructions.
+#
+# Build:
+#   docker build -f Dockerfile.repro -t tandem-rlvr:repro .
+# Run (training entrypoint):
+#   docker run --gpus all -it -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+#              -v $(pwd)/scratch:/workspace/Tandem-RLVR/scratch \
+#              tandem-rlvr:repro bash verl/run_tandem_native_grpo_deepscaler.sh
+#
+# Layer breakdown (multiple RUNs for debuggability; ~20-22 GB final image):
+#   1. NGC base                                  ~15 GB
+#   2. Uninstall NGC's torch fork                no add
+#   3. Install vllm 0.8.5 + torch 2.6 + deps     ~5 GB
+#   4. flash-attn 2.7.4.post1 wheel              ~200 MB
+#   5. flashinfer 0.2.2.post1 wheel              ~200 MB
+#   6. Clone repo + overlay vllm + install verl  ~100 MB
+#   7. Import smoke checks                       no add
+
+FROM nvcr.io/nvidia/pytorch:24.08-py3
+
+RUN pip uninstall -y torch torchvision torchaudio pytorch-quantization pytorch-triton \
+                     torch-tensorrt xgboost transformer_engine flash_attn apex \
+                     megatron-core grpcio
+
+RUN pip install --no-cache-dir \
+        vllm==0.8.5 torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+        tensordict==0.6.2 torchdata transformers==4.57.3 accelerate datasets \
+        ray[default] codetiming hydra-core wandb dill pybind11 mathruler math-verify \
+        "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" \
+        "optree>=0.13.0" "pydantic>=2.9"
+
+RUN pip install --no-cache-dir \
+        https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+RUN pip install --no-cache-dir \
+        https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.2.post1/flashinfer_python-0.2.2.post1+cu124torch2.6-cp38-abi3-linux_x86_64.whl
+
+WORKDIR /workspace
+RUN git clone https://github.com/CSSLab/Tandem-RLVR.git
+WORKDIR /workspace/Tandem-RLVR
+
+RUN VLLM_DIR=$(python -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null | tail -1) \
+ && cp -r vllm_source/vllm/* "$VLLM_DIR/" \
+ && pip install -e verl
+
+# Smoke-test that the overlay and verl install are importable.
+RUN python -c "import vllm; print('vllm:', vllm.__version__, '->', vllm.__file__)" \
+ && python -c "from vllm.config import TandemConfig; print('TandemConfig OK')" \
+ && python -c "from vllm.v1.worker.tandem import TandemModelManager; print('TandemModelManager OK')" \
+ && python -c "from vllm.v1.sample.tandem_sampler import TandemSampler; print('TandemSampler OK')" \
+ && python -c "import verl; print('verl:', verl.__file__)"
+
+CMD ["bash"]
