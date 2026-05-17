@@ -23,24 +23,26 @@ The full install — base image, pinned pip stack, our vLLM overlay, editable ve
 
 ```bash
 git clone https://github.com/CSSLab/Tandem-RLVR.git && cd Tandem-RLVR
-
-# Wandb credentials (gitignored, lives only on host; bind-mounted into the container at run time)
-mkdir -p scratch && cat > scratch/wandb_secrets.env <<'EOF'
-WANDB_API_KEY=<your key>
-WANDB_ENTITY=<your entity>
-WANDB_PROJECT_TANDEM_NATIVE_GRPO_DEEPSCALER=tandem-native-grpo-deepscaler
-WANDB_PROJECT_VANILLA_GRPO_DEEPSCALER=vanilla-grpo-deepscaler
-EOF
-
 docker build -f Dockerfile.repro -t tandem-rlvr:repro .
-docker run --gpus all -it -v $(pwd)/scratch:/workspace/Tandem-RLVR/scratch \
-           -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-           tandem-rlvr:repro bash
+docker run --gpus all -it -v $(pwd)/scratch:/workspace/Tandem-RLVR/scratch tandem-rlvr:repro bash
 ```
 
 Pinned stack inside the image: Python 3.10, vLLM 0.8.5, torch 2.6.0+cu124, transformers 4.57.3, flash-attn 2.7.4.post1, flashinfer 0.2.2.post1 (full list in `Dockerfile.repro`).
 
 ## 2. Training (verl, DeepScaleR, Qwen3-4B-Instruct-2507)
+
+The launchers source `scratch/wandb_secrets.env` for credentials (gitignored). Create it on the host before running:
+
+```bash
+cat > scratch/wandb_secrets.env <<'EOF'
+WANDB_API_KEY=<your key>
+WANDB_ENTITY=<your entity>
+WANDB_PROJECT_TANDEM_NATIVE_GRPO_DEEPSCALER=tandem-native-grpo-deepscaler
+WANDB_PROJECT_VANILLA_GRPO_DEEPSCALER=vanilla-grpo-deepscaler
+EOF
+```
+
+Then:
 
 ```bash
 bash verl/run_tandem_native_grpo_deepscaler.sh    # canonical TRL
