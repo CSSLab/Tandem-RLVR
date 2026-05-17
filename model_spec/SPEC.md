@@ -107,138 +107,119 @@ Format:
 
 ```
 verl-llm-tandem/
-    verl/                        <- upstream verl fork (original source)
+    Tandem_Training_NIPS_2026.pdf   <- paper artifact (top-level reference)
+    vllm_source/                     <- patched vLLM 0.8.5 (canonical TRL backend)
+        vllm/
+            v1/
+                worker/tandem.py            <- TandemModelManager (junior model + KV cache)
+                sample/tandem_sampler.py    <- TandemSampler (5 selection strategies)
+                worker/gpu_model_runner.py  <- dual-forward wiring [MODIFIED]
+                worker/gpu_worker.py        <- junior TP group init [MODIFIED]
+                core/sched/scheduler.py     <- authorship-mask propagation [MODIFIED]
+                engine/output_processor.py  <- per-request mask accumulation [MODIFIED]
+                engine/__init__.py          <- per-step mask field [MODIFIED]
+                outputs.py                  <- mask in v1 SamplerOutput [MODIFIED]
+            config.py                       <- TandemConfig dataclass [MODIFIED]
+            outputs.py                      <- mask in top-level outputs [MODIFIED]
+            engine/arg_utils.py             <- create_tandem_config factory [MODIFIED]
+            distributed/parallel_state.py   <- junior TP group lifecycle [MODIFIED]
+    verl/                            <- upstream verl 0.5.0 fork (original source)
         verl/
-            trainer/ppo/
-                ray_trainer.py   <- RayPPOTrainer (core training loop)
             workers/
-                fsdp_workers.py  <- ActorRolloutRefWorker base class
-    scratch/
-        tandem/                  <- tandem rollout prototypes (our code)
+                rollout/vllm_rollout/vllm_rollout_spmd.py  <- mask -> DataProto [MODIFIED]
+                actor/dp_actor.py           <- senior-only mask in PG loss [MODIFIED]
+            trainer/ppo/ray_trainer.py      <- best-ckpt + pass@N val [MODIFIED]
+        run_tandem_native_grpo_deepscaler.sh  <- canonical TRL launch (paper config)
+        run_tandem_native_grpo_math.sh
+        run_tandem_native_grpo_gsm8k.sh
+        run_vanilla_grpo_deepscaler.sh        <- baseline GRPO launches
+        run_vanilla_grpo_math.sh
+        run_vanilla_grpo_gsm8k_benchmark.sh
+    tandem_eval/                     <- evaluation suite (handoff robustness, solo, SD, etc.)
+    archive/                         <- gitignored R&D history (early prototypes)
+        tandem/
             tandem_rollout.py            <- HF-loop rollout (ThreadPoolExecutor)
             tandem_rollout_optimized.py  <- CUDA-stream optimized HF-loop
             tandem_rollout_vllm.py       <- vLLM-backed step-by-step rollout
-            tandem_rollout_ray.py        <- Ray actor-based frozen model
+            tandem_rollout_ray.py        <- Ray actor-based junior
             tandem_rollout_shared_kv.py  <- shared KV-cache experiment
-            tandem_worker.py             <- TandemActorRolloutWorker (FSDP)
-            frozen_model_actor.py        <- FrozenModelActor (Ray remote)
+            tandem_worker.py             <- early FSDP integration
+            frozen_model_actor.py        <- Ray remote junior
+    scratch/                         <- gitignored: datasets, checkpoints, wandb secrets
     model_spec/
-        SPEC.md              <- this file (authoritative)
-        results/             <- per-feature test result summaries
-        changelog/           <- per-session change logs
+        SPEC.md          <- this file (authoritative for code editing)
+        TERMINOLOGY.md   <- paper <-> code naming (authoritative for rename)
+        results/         <- per-feature test result summaries
+        changelog/       <- per-session change logs
 ```
 
 ---
 
 ## 6. Codebase Summary
 
-### Relationship to `verl-tandem`
+The canonical Tandem Reinforcement Learning (TRL) implementation lives in two patched trees inside this repo: `vllm_source/` (dual-decoder backend, paper §A.1.1) and `verl/` (rollout extractor + senior-only mask in the actor, paper §3.4). This is what the paper trained. Earlier auto-memory references to a separate `/datadrive/difan/verl-tandem/recipe/tandem/` production repo are obsolete — that path does not exist on this host, and this repo is the single source of truth for the TRL recipe.
 
-This repo (`verl-llm-tandem`) is a **parallel scratch workspace** for the tandem training project.
-The production-ready tandem recipe lives in `/datadrive/difan/verl-tandem/recipe/tandem/`.
-This repo contains:
-- A forked copy of the verl library (`verl/`)
-- Scratch prototypes under `scratch/tandem/` exploring different rollout strategies
-
-The prototypes here are less mature than the production recipe — they use `model_a`/`model_b`
-naming (vs `primary`/`tandem`), lack `TokenSelectionStrategy` integration (using raw `prob_a`
-Bernoulli instead), and do not output `primary_log_probs`/`tandem_log_probs` (except the
-optimized variant).
+All identifiers use senior/junior vocabulary per `TERMINOLOGY.md`. The notes below already use the target vocabulary even where the current source still spells things `primary`/`frozen`; the sweeping rename to converge spelling lands in a separate dedicated commit.
 
 ---
 
-### `tandem_rollout.py` — `TandemRollout`
+### 6.1 `vllm_source/vllm/v1/worker/tandem.py` — `TandemModelManager`
 
-HF-style autoregressive loop using `ThreadPoolExecutor` for parallel forward passes.
-Both models maintain separate KV caches. Per step: forward both models, sample from each,
-Bernoulli-select which candidate token to keep. Both models are fed the same chosen token.
+Holds the frozen junior model. On engine init, builds a `VllmConfig` copy with the junior model id, resolves the junior device (`junior_gpu_devices[tp_rank]` or `tp_rank + tp_size` by default), and loads the junior with the layer-name prefix `JUNIOR_PREFIX = "tandem_junior."`. The prefixed layers are merged into the senior's `static_forward_context` so the engine's forward routing can dispatch them without colliding with senior layers. A separate junior KV-cache tensor is allocated on the junior device with shape matching the senior's paged-attention block layout. `junior_forward(...)` runs the junior under `_junior_tp_context()` (a context manager that swaps to the junior's TP group when one is configured) and returns junior logits at the same logits-indices as the senior's forward — ready for the sampler.
 
-Output keys: `prompts`, `responses`, `input_ids`, `attention_mask`, `position_ids`, `model_a_mask`.
+### 6.2 `vllm_source/vllm/v1/sample/tandem_sampler.py` — `TandemSampler`
 
----
+Per step: samples once from `senior_logits` and once from `junior_logits` (both via the standard `Sampler`), computes a per-batch `use_senior` boolean via `_select(...)`, and emits `chosen_tokens = where(use_senior, senior_tokens, junior_tokens)` plus `authorship_mask = use_senior.int32`. Five selection strategies, of which `word` is the paper default:
 
-### `tandem_rollout_optimized.py` — `TandemRolloutOptimized`
+- `word` — per-orthographic-boundary Bernoulli(p) handoff with `max_gap_tokens=32` cap (paper §3.3, §A.1.2). Uses `sampling_metadata.generators[i]` for reproducible per-request draws. State (active model, tokens since last switch, prev length) cached in `_word_state` keyed by `id(output_token_ids)`; resumes per step instead of replaying.
+- `bernoulli` — per-token Bernoulli(p). Token-granularity ablation; not the paper.
+- `sentence` — handoff at `\n\n`-ending boundary tokens; paragraph-granularity ablation.
+- `chunk` — fixed `chunk_size` per side, deterministic cycle.
+- `alternating` — strict per-step toggle.
 
-Drop-in replacement using CUDA streams instead of ThreadPoolExecutor. Adds `_decode_step`
-and `_sample_tokens` helpers to keep CC low. Outputs `primary_log_probs`, `tandem_log_probs`,
-`model_mask` — matching the production interface. Uses `TokenSelectionStrategy` from the
-production recipe.
+### 6.3 `vllm_source/vllm/config.py` — `TandemConfig`
 
-Benchmark: ~1.4-1.5x speedup over `TandemRollout` (see `model_spec/results/2026-03-04_rollout-stream-opt.md`).
+Dataclass exposed to verl via `engine_kwargs.vllm.tandem_config.*`. Fields cover junior model id, junior device(s), Bernoulli `prob_senior`, selection strategy, `chunk_size`, `max_gap_tokens`, `boundary_token_ids`, and the TP/dtype/quantization knobs the junior may diverge from the senior on. `__post_init__` validates the strategy against the literal whitelist and enforces `boundary_token_ids` presence for `sentence`/`word`. Mutually exclusive with vLLM speculative decoding (enforced in `engine/arg_utils.py`).
 
----
+### 6.4 `verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py` — rollout extractor
 
-### `tandem_rollout_vllm.py` — `TandemRolloutVLLM`
+Converts the OmegaConf `tandem_config` to a plain dict before handing to `LLM(...)`. Auto-resolves `boundary_token_ids` from the active tokenizer when the strategy is `sentence` (token IDs whose decoded surface ends with `\n\n`) or `word` (token IDs whose decoded surface starts with the BPE leading-space marker, ~53k of 151k IDs for Qwen3). After generation, reads `output.outputs[k].authorship_mask` from each completion and pads to `response_length`; the result is added to the rollout `DataProto` as a tensor field consumed by the actor.
 
-Uses two vLLM `LLM` instances (one per GPU). Step-by-step generation: each step calls
-`vllm.generate(max_tokens=1, logprobs=20)` on both models, reconstructs sparse logits from
-top-20 logprobs, samples, and Bernoulli-selects. Sequential token appending to `current_token_ids`.
+### 6.5 `verl/workers/actor/dp_actor.py` — senior-only mask in PG loss
 
-Limitation: re-initializes vLLM inference from scratch per step (no persistent KV cache reuse
-across steps within vLLM — relies on prefix caching).
+Selects the authorship-mask field from the rollout batch, builds a per-position weight (1 at senior positions, `junior_token_loss_weight` at junior positions; paper sets this to 0 → senior-only loss), and elementwise-multiplies into `response_mask` before the standard policy-gradient sum. Also emits four per-microbatch metrics: `tandem/senior_token_fraction`, `tandem/junior_token_fraction`, `tandem/switches_per_seq`, `tandem/tokens_per_sent`. With `junior_token_loss_weight=0`, the loss is formally identical to vanilla GRPO restricted to senior positions, matching eq. (1) of the paper.
 
----
+### 6.6 `verl/run_tandem_native_grpo_deepscaler.sh` — canonical TRL launch
 
-### `tandem_rollout_ray.py` — `TandemRolloutRay`
-
-Hot model runs locally; frozen model is a `FrozenModelActor` (Ray remote). Forward calls are
-dispatched via ThreadPoolExecutor. The Ray actor manages its own KV cache keyed by `batch_id`,
-cleared after each minibatch.
+Paper-aligned config: Qwen3-4B-Instruct-2507 as both senior init and self-paired junior, `selection_strategy=word`, `prob_senior=0.5`, `max_gap_tokens=32`, `junior_token_loss_weight=0`, GRPO with `kl_loss=False`, `entropy_coeff=0`, temp=0.6, 2× A100 80GB with `frozen_gpu_devices=[1]`. Sources wandb credentials from `scratch/wandb_secrets.env` (gitignored). The other `run_tandem_native_grpo_{math,gsm8k}.sh` variants are off-paper ablations preserved for reference.
 
 ---
 
-### `tandem_rollout_shared_kv.py` — `TandemRolloutSharedKV`
+## 7. How the senior-only mask reaches the loss
 
-Experimental: attempts to share vLLM's GPU KV cache between two `LLM` instances by
-monkey-patching `worker.cache_engine[0].gpu_cache`. Uses vLLM v0 API (`VLLM_USE_V1=0`).
-Text-based prompt passing (decode → re-encode each step).
+A trace through the data flow on a single training step:
 
----
+1. `TandemSampler.forward(senior_logits, junior_logits, sampling_metadata)` returns the chosen-token tensor and a per-batch `use_senior` bool. The bool is reshaped to `[batch, 1]` int32 → the per-step authorship.
+2. `gpu_model_runner` stores it on `ModelRunnerOutput.authorship_mask` alongside the sampled tokens.
+3. `scheduler.update_from_output(...)` distributes the per-batch mask to each `EngineCoreOutput` as `new_authorship_mask`.
+4. `output_processor` accumulates per-request `new_authorship_mask` deltas into a list, surfacing the full per-token mask in the completion's `authorship_mask` field.
+5. `vllm_rollout_spmd._generate(...)` reads `output.outputs[k].authorship_mask` per sample, pads to `response_length`, and adds it to the rollout `DataProto`.
+6. `dp_actor._forward_micro_batch_with_log` looks it up, weights `response_mask` by it (1 at senior, `junior_token_loss_weight` at junior), and uses the weighted mask in the standard PG sum.
 
-### `tandem_worker.py` — `TandemActorRolloutWorker`
+Step 6 is the only place GRPO touches TRL; everything upstream is plumbing for that one elementwise multiply. The rest of `ray_trainer.fit()` is unmodified — TRL is a pure rollout-structure change, not a loss change, exactly as paper §3.4 claims.
 
-Extends `ActorRolloutRefWorker`. Lazy-initializes `TandemRollout` on first `generate_sequences`
-call. Delegates to `super()` when tandem is disabled.
-
----
-
-### `frozen_model_actor.py` — `FrozenModelActor`
-
-Ray remote actor wrapping a frozen HF model on a dedicated GPU. Maintains per-batch KV cache
-dict. Used by `TandemRolloutRay`.
+`ray_trainer.py` carries two unrelated edits — best-checkpoint tracking for HF-format export and per-dataset pass@N val-core reporting — neither tandem-specific.
 
 ---
 
-## 7. verl `ray_trainer.py` — Key Concepts
+## 8. Implementation paths
 
-The upstream `RayPPOTrainer` in `verl/verl/trainer/ppo/ray_trainer.py` is the base class
-that any tandem trainer would extend. Key functions:
+Three paths exist in the repo, with different status. Only the first is what the paper trained.
 
-- `compute_response_mask(data)`: extracts response portion of attention mask
-- `compute_advantage(data, adv_estimator, ...)`: computes GAE/GRPO/REINFORCE++ advantages
-- `apply_kl_penalty(data, kl_ctrl)`: KL divergence penalty on token-level rewards
-- `RayPPOTrainer.fit()`: main training loop — generates sequences, computes rewards,
-  computes advantages, updates actor/critic
-- The `fit()` loop calls `generate_sequences` -> `compute_ref_log_prob` -> `compute_reward`
-  -> `compute_advantage` -> `update_actor` -> `update_critic` per step
+| Path | Location | Status |
+|---|---|---|
+| **vLLM-native dual-decoder** (canonical TRL) | `vllm_source/vllm/v1/*` + `verl/verl/workers/{rollout,actor}/*` | **What the paper trained.** Active. Used by every tracked `run_*.sh`. ~2× single-model latency (paper §5.1). |
+| Early HF-loop prototypes | `archive/tandem/*.py` (gitignored) | Superseded. ~30× single-model latency at short contexts; OOM at 512+ tokens on 80 GB GPUs (paper §A.1). Kept on disk for R&D reference, not for active development. |
+| Off-paper selection-strategy ablations | `tandem_sampler.py` strategies `bernoulli`, `chunk`, `alternating`, `sentence` | Selectable at runtime via `selection_strategy=…`. Not used by the paper (which uses `word`). Retained as a contribution surface — they expose the rollout-structure design axis the paper argues is under-explored. |
 
-The tandem recipe in production (`verl-tandem`) overrides `fit()` to monkey-patch
-`compute_response_mask` (for `own_tokens` loss scoping) and `_update_actor` (for
-tandem model updates). The scratch prototypes here do not yet have a trainer override.
-
----
-
-## 8. Production vs Scratch — Feature Gap
-
-| Feature | Production (`verl-tandem/recipe/tandem/`) | Scratch (`verl-llm-tandem/scratch/tandem/`) |
-|---------|-------------------------------------------|---------------------------------------------|
-| TokenSelectionStrategy (Bernoulli/Chunk/Alternating) | Yes | Only in `tandem_rollout_optimized.py` |
-| `primary_log_probs` / `tandem_log_probs` output | Yes | Only in `tandem_rollout_optimized.py` |
-| Naming convention (`primary`/`tandem`) | Yes | Uses `model_a`/`model_b` |
-| FSDP integration | Full (`TandemActorRolloutRefWorker`) | Partial (`TandemActorRolloutWorker`) |
-| Inference-backed path (vLLM async) | Yes (`InferenceBackedTandemActorRolloutRefWorker`) | No |
-| TandemTrainer (loss scope, tandem update) | Yes | No |
-| CUDA stream optimization | Yes (in `TandemRolloutOptimized`) | Yes (same file) |
-| vLLM step-by-step rollout | No | Yes (`tandem_rollout_vllm.py`) |
-| Ray-based frozen model | No | Yes (`tandem_rollout_ray.py`) |
-| Shared KV cache experiment | No | Yes (`tandem_rollout_shared_kv.py`) |
+Canonical TRL configuration: `selection_strategy=word`, `prob_senior=0.5`, `max_gap_tokens=32`, `junior_token_loss_weight=0`, self-paired junior. Any deviation belongs to an explicit ablation script, not the default.
