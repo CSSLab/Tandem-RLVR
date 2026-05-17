@@ -441,6 +441,12 @@ class DataParallelPPOActor(BasePPOActor):
                             primary_frac = 0.5
                         micro_batch_metrics["tandem/primary_token_fraction"] = primary_frac
                         micro_batch_metrics["tandem/frozen_token_fraction"] = 1.0 - primary_frac
+                        if tandem_mask.shape[-1] > 1:
+                            trans = (tandem_mask[:, 1:] != tandem_mask[:, :-1]).float()
+                            sw = (trans * orig_response_mask[:, 1:].float()).sum(-1)
+                            lens = orig_response_mask.float().sum(-1).clamp(min=1)
+                            micro_batch_metrics["tandem/switches_per_seq"] = sw.mean().item()
+                            micro_batch_metrics["tandem/tokens_per_sent"] = (lens / (sw + 1)).mean().item()
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode

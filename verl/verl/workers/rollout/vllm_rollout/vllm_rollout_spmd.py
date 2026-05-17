@@ -215,16 +215,35 @@ class vLLMRollout(BaseRollout):
             engine_kwargs["tandem_config"] = OmegaConf.to_container(
                 engine_kwargs["tandem_config"], resolve=True)
         # [MODIFIED 2026-04-04 auto-resolve boundary_token_ids for sentence strategy]
+        # [MODIFIED 2026-04-17 use \n\n-ending tokens instead of bare .,?,\n —
+        #  bare '.' (id=13) fires on every LaTeX decimal/subscript (~50/resp);
+        #  bare '\n' (id=198) fires only ~1/resp in MATH think blocks;
+        #  tokens ending with \n\n (e.g. '.\n\n'=382) fire ~17/resp at true
+        #  reasoning-step paragraph boundaries (~86 tok/chunk)]
         if "tandem_config" in engine_kwargs:
             tc = engine_kwargs["tandem_config"]
             if tc.get("selection_strategy") == "sentence" and not tc.get("boundary_token_ids"):
                 from transformers import AutoTokenizer as _AT
                 _tok = _AT.from_pretrained(model_path, trust_remote_code=True)
-                _ids = set()
-                for ch in [".", "?", "\n"]:
-                    _ids.update(_tok.encode(ch, add_special_tokens=False))
-                tc["boundary_token_ids"] = sorted(_ids)
-                logger.info(f"Tandem sentence strategy: auto-resolved boundary_token_ids={tc['boundary_token_ids']}")
+                # old: for ch in [".", "?", "\n"]: _ids.update(_tok.encode(ch, ...))
+                _ids = sorted({tid for tid in range(_tok.vocab_size)
+                               if _tok.decode([tid]).endswith('\n\n')})
+                tc["boundary_token_ids"] = _ids
+                logger.warning(f"Tandem sentence strategy: auto-resolved {len(_ids)} "
+                               f"\\n\\n-ending boundary tokens (e.g. {_ids[:5]})")
+            # [MODIFIED 2026-04-24 auto-resolve boundary_token_ids for word strategy:
+            #  Qwen3 BPE Ġ-prefix tokens mark word starts (~53k/151k ids); paired
+            #  with max_gap_tokens=32 fallback for atomic math/LaTeX units]
+            elif tc.get("selection_strategy") == "word" and not tc.get("boundary_token_ids"):
+                from transformers import AutoTokenizer as _AT
+                _tok = _AT.from_pretrained(model_path, trust_remote_code=True)
+                _ids = sorted({tid for tid in range(_tok.vocab_size)
+                               if _tok.convert_ids_to_tokens(tid).startswith('Ġ')})
+                tc["boundary_token_ids"] = _ids
+                _gap = tc.get("max_gap_tokens", 32)
+                logger.warning(f"Tandem word strategy: auto-resolved {len(_ids)} "
+                               f"Ġ-prefix boundary tokens (e.g. {_ids[:5]}), "
+                               f"max_gap_tokens={_gap}")
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
@@ -470,6 +489,12 @@ class vLLMRollout(BaseRollout):
             batch["model_mask"] = pad_2d_list_to_length(
                 tandem_model_masks, 0, max_length=self.config.response_length
             ).to(idx.device).to(torch.float32)
+
+            # [MODIFIED 2026-04-17 debug: log sentence-level interleaving stats]
+            # (commented out after confirming correct paragraph-level alternation)
+            # switches, tok_per_sent, pfracs = [], [], []
+            # for mask in tandem_model_masks: ...
+            # logger.warning(f"[TandemDebug] ...")
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

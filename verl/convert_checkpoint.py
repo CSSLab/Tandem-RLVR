@@ -81,7 +81,7 @@ def convert_fsdp_checkpoint(checkpoint_dir, output_dir):
         print(f"  {file_path.name} ({size_mb:.1f} MB)")
 
 if __name__ == "__main__":
-    checkpoint_dir = "/datadrive/difan/verl-llm-tandem/scratch/checkpoints/vanilla_grpo_gsm8k_Qwen3-0.6B/global_step_130/actor"
-    output_dir = "/datadrive/difan/verl-llm-tandem/scratch/hf/Qwen3-0.6B-gsm8k-vanilla-step130"
+    checkpoint_dir = "/datadrive/difan/verl-llm-tandem/scratch/checkpoints/tandem_word_grpo_deepscaler_at4_Qwen3-4B-Instruct-2507_jr-Qwen3-0.6B_gap32_no-jr-tkn-weight/global_step_180/actor"
+    output_dir = "/datadrive/difan/verl-llm-tandem/scratch/hf/tandem_word_grpo_deepscaler_at4_Qwen3-4B-Instruct-2507_jr-Qwen3-0.6B_gap32_no-jr-tkn-weight-step180"
     
     convert_fsdp_checkpoint(checkpoint_dir, output_dir)

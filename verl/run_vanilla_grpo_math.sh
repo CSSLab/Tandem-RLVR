@@ -5,8 +5,6 @@ conda activate tandem-verl
 
 export HF_HOME=/datadrive/difan/verl-llm-tandem/scratch/models
 
-export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
-
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_LEVEL=LOC
@@ -19,7 +17,7 @@ if [ -f "$SECRETS_FILE" ]; then
 else
     echo "[error] wandb secrets not found at $SECRETS_FILE" >&2; exit 1
 fi
-export WANDB_PROJECT=$WANDB_PROJECT_TANDEM_NATIVE_GRPO_MATH
+export WANDB_PROJECT=$WANDB_PROJECT_VANILLA_GRPO_MATH
 
 set -x
 SCRATCH_DIR=/datadrive/difan/verl-llm-tandem/scratch
@@ -29,29 +27,8 @@ VAL_B=512
 N=8
 L=3000
 VAL_L=3000
-SENIOR_MODEL=${SENIOR_MODEL:-Qwen/Qwen3-4B-Instruct-2507}
-JUNIOR_MODEL=${JUNIOR_MODEL:-${SENIOR_MODEL}}
-
-# "bernoulli" (token-level) or "sentence" (paragraph-level round-robin).
-# Paragraph-level uses all tokens whose decoded string ends with \n\n —
-# primarily '.\n\n' (token 382, ~11/resp) — matching true reasoning-step
-# boundaries in Qwen3 MATH thinking blocks (~17 switches/resp, ~86 tok/chunk).
-# boundary_token_ids is auto-resolved in vllm_rollout_spmd.py when not set.
-TANDEM_STRATEGY=${TANDEM_STRATEGY:-sentence}
-
-SENIOR_TAG=$(echo ${SENIOR_MODEL} | sed 's|.*/||')
-JUNIOR_TAG=$(echo ${JUNIOR_MODEL} | sed 's|.*/||')
-if [ "$SENIOR_MODEL" = "$JUNIOR_MODEL" ]; then
-    MODEL_TAG=${SENIOR_TAG}
-else
-    MODEL_TAG=${SENIOR_TAG}_jr-${JUNIOR_TAG}
-fi
-
-if [ "$TANDEM_STRATEGY" = "sentence" ]; then
-    NAME=tandem_sentence_grpo_math_${MODEL_TAG}
-else
-    NAME=tandem_native_grpo_math_${MODEL_TAG}
-fi
+MODEL_NAME=Qwen/Qwen3-4B-Instruct-2507
+NAME=vanilla_grpo_math_Qwen3-4B-Instruct-2507
 
 CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -65,7 +42,7 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     data.max_response_length=$L \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=${SENIOR_MODEL} \
+    actor_rollout_ref.model.path=${MODEL_NAME} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -78,9 +55,9 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=1 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=2 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.data_parallel_size=1 \
@@ -93,14 +70,7 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     +actor_rollout_ref.rollout.val_response_length=$VAL_L \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
-    actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.enforce_eager=True \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.enabled=True \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.frozen_model=${JUNIOR_MODEL} \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.prob_primary=0.5 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.selection_strategy=${TANDEM_STRATEGY} \
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.tandem_config.frozen_gpu_devices=[1]' \
-    +actor_rollout_ref.actor.tandem_jr_tkn_weight=0.15 \
     actor_rollout_ref.ref.strategy=fsdp \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.enable=False \
@@ -108,9 +78,9 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     +reward_model.custom_reward_function.path=verl/utils/reward_score/math_dataset.py \
     +reward_model.custom_reward_function.name=compute_score \
     trainer.logger='[console,wandb]' \
-    trainer.project_name=tandem-native-grpo-math \
+    trainer.project_name=vanilla-grpo-math \
     trainer.experiment_name=${NAME} \
-    trainer.n_gpus_per_node=1 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.default_local_dir=$SCRATCH_DIR/checkpoints/${NAME} \
     trainer.save_freq=10 \
@@ -119,7 +89,7 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     +ray_init.num_cpus=16 \
     trainer.val_before_train=False \
     trainer.log_val_generations=10 \
-    trainer.resume_mode='auto' \
+    trainer.resume_mode='disable' \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.max_critic_ckpt_to_keep=1 \
     +trainer.start_save_step=20 \

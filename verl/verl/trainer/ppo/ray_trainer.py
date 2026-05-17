@@ -652,15 +652,12 @@ class RayPPOTrainer:
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
+                    # [MODIFIED 2026-04-21 only record pass@N (= best@N/mean) per dataset in val-core;
+                    #  route mean/maj/best_std/worst/std to val-aux]
+                    if var_name == core_var and metric_name == f"best@{n_max}/mean":
+                        pfx = f"val-core/{data_source}/{var_name}/pass@{n_max}"
                     else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                        pfx = f"val-aux/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
         if len(sample_turns) > 0:
@@ -672,6 +669,23 @@ class RayPPOTrainer:
         guillemet_count = sum(1 for text in sample_outputs if "<<" in text or ">>" in text)
         guillemet_rate = guillemet_count / len(sample_outputs) if sample_outputs else 0.0
         metric_dict["val-core/guillemet_rate"] = guillemet_rate
+
+        macro_sources = self.config.trainer.get("val_macro_avg_sources", None)
+        if macro_sources:
+            import re as _re
+            pat = _re.compile(r"^val-core/([^/]+)/([^/]+)/(.+)$")
+            per_metric = {}
+            for k, v in metric_dict.items():
+                m = pat.match(k)
+                if not m:
+                    continue
+                src, var, mname = m.group(1), m.group(2), m.group(3)
+                if src not in macro_sources:
+                    continue
+                per_metric.setdefault((var, mname), {})[src] = v
+            for (var, mname), src2val in per_metric.items():
+                if len(src2val) == len(macro_sources):
+                    metric_dict[f"val-core/macro_avg/{var}/{mname}"] = sum(src2val.values()) / len(src2val)
 
         return metric_dict
 

@@ -50,7 +50,15 @@ def default_compute_score(
 
         res = math_reward.compute_score(solution_str, ground_truth)
     # [MODIFIED 2026-04-09 add hendrycks_math training data source]
-    elif data_source == "EleutherAI/hendrycks_math":
+    # [MODIFIED 2026-04-20 route deepscaler train + (amc_23_25/aime_24_26/minerva) eval
+    #  through the same boxed-answer grader used for hendrycks_math]
+    elif data_source in (
+        "EleutherAI/hendrycks_math",
+        "deepscaler",
+        "amc_23_25",
+        "aime_24_26",
+        "minerva",
+    ):
         from . import math_dataset
 
         res = math_dataset.compute_score(solution_str, ground_truth)
