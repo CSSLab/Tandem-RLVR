@@ -1,7 +1,9 @@
 import sys
 import os
-sys.path.insert(0, '/datadrive/difan/verl-llm-tandem/verl')
-sys.path.insert(0, '/datadrive/difan/verl-llm-tandem/tandem_eval')
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "verl"))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "tandem_eval"))
 
 import json
 import numpy as np
@@ -12,7 +14,7 @@ from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 from grader import load_grader
 
-SCRATCH = '/datadrive/difan/verl-llm-tandem/scratch'
+SCRATCH = os.environ.get("TANDEM_SCRATCH", os.path.join(_REPO_ROOT, "scratch"))
 BENCHMARKS = {
     'amc_23_25':  f'{SCRATCH}/MATH/amc_23_25/test.parquet',
     'aime_24_26': f'{SCRATCH}/MATH/aime_24_26/test.parquet',

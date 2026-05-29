@@ -3,7 +3,9 @@
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate tandem-verl
 
-export HF_HOME=/datadrive/difan/verl-llm-tandem/scratch/models
+source "$(dirname "$(readlink -f "$0")")/../scripts/tandem_paths.sh"
+export HF_HOME
+SCRATCH_DIR="${TANDEM_SCRATCH}"
 
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
@@ -22,7 +24,6 @@ fi
 export WANDB_PROJECT=$WANDB_PROJECT_TANDEM_NATIVE_GRPO_DEEPSCALER
 
 set -x
-SCRATCH_DIR=/datadrive/difan/verl-llm-tandem/scratch
 
 # [thinking-suppression] Senior (Qwen3-4B-Instruct-2507)'s default chat_template
 # has no `enable_thinking` conditional, so passing enable_thinking=False would

@@ -3,7 +3,9 @@
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate tandem-verl
 
-export HF_HOME=/datadrive/difan/verl-llm-tandem/scratch/models
+source "$(dirname "$(readlink -f "$0")")/../scripts/tandem_paths.sh"
+export HF_HOME
+SCRATCH_DIR="${TANDEM_SCRATCH}"
 
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=1
@@ -20,7 +22,6 @@ fi
 export WANDB_PROJECT=$WANDB_PROJECT_VANILLA_GRPO_DEEPSCALER
 
 set -x
-SCRATCH_DIR=/datadrive/difan/verl-llm-tandem/scratch
 
 B=16
 VAL_B=512

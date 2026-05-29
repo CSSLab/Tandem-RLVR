@@ -96,6 +96,17 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _tandem_repo_root() -> str:
+    repo = os.environ.get("TANDEM_REPO_ROOT")
+    if repo:
+        return repo
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _tandem_scratch_dir() -> str:
+    return os.environ.get("TANDEM_SCRATCH", os.path.join(_tandem_repo_root(), "scratch"))
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -1021,7 +1032,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if hasattr(self, '_tandem_rollout_instance'):
             self._update_hot_model_weights_from_fsdp()
 
-        cache_dir = "/datadrive/difan/verl-llm-tandem/cache/vllm_validation"
+        cache_dir = os.path.join(_tandem_scratch_dir(), "cache", "vllm_validation")
 
         if self._is_offload_param:
             from verl.utils.fsdp_utils import load_fsdp_model_to_gpu
@@ -1156,7 +1167,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _tandem_generate_sequences(self, prompts: DataProto, tandem_config):
         import sys
         import os
-        sys.path.insert(0, '/datadrive/difan/verl-llm-tandem/scratch')
+        sys.path.insert(0, _tandem_scratch_dir())
         from tandem.tandem_rollout import TandemRollout
 
         assert self._is_rollout
@@ -1234,7 +1245,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         logger.info("[DEBUG] _tandem_vllm_generate_sequences entered")
         import sys
         import os
-        sys.path.insert(0, '/datadrive/difan/verl-llm-tandem/scratch')
+        sys.path.insert(0, _tandem_scratch_dir())
         from tandem.tandem_rollout_vllm import TandemRolloutVLLM
 
         assert self._is_rollout
@@ -1301,7 +1312,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             logger.info(f"[Rank {rank}] GPU assignment: gpu_a={tandem_config_for_vllm['gpu_a']}, gpu_b={tandem_config_for_vllm['gpu_b']}")
 
             logger.info(f"[Rank {rank}] Initializing tandem vLLM directly (in-process)...")
-            sys.path.insert(0, '/datadrive/difan/verl-llm-tandem/scratch')
+            sys.path.insert(0, _tandem_scratch_dir())
             from tandem.tandem_rollout_vllm import TandemRolloutVLLM
 
             torch.cuda.empty_cache()
@@ -1365,7 +1376,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         import torch.distributed as dist
 
-        checkpoint_dir = tandem_config.get('hot_model_checkpoint_dir', '/datadrive/difan/verl-llm-tandem/scratch/tandem_hot_model_tmp')
+        checkpoint_dir = tandem_config.get(
+            'hot_model_checkpoint_dir',
+            os.path.join(_tandem_scratch_dir(), 'tandem_hot_model_tmp'),
+        )
 
         rank = dist.get_rank() if dist.is_initialized() else 0
 
