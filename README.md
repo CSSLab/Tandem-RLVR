@@ -5,9 +5,9 @@
 RLVR raises a model's reasoning ability without any pressure to keep that reasoning legible to the
 weaker models and people it has to work with. TRLVR changes one thing in the rollout: every rollout
 is co-generated with a frozen junior, a copy of the senior's own pre-RL base, and the policy
-gradient covers only the tokens the senior wrote. One change to the rollout, three properties: the
-TRLVR senior retains its solo capability, keeps almost all of it when the junior takes over half
-the reasoning, and keeps its reasoning in language the junior can follow.
+gradient covers only the tokens the senior wrote. On competition math, the Tandem RLVR senior
+matches GRPO in solo reasoning capability, retains nearly all of that capability when the junior
+takes over half the reasoning, and expresses its reasoning in language the junior can follow.
 
 ![Tandem RLVR](docs/teaser.png)
 
