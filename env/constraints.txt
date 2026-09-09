@@ -1,0 +1,7 @@
+# Passed as `pip install -e third_party/verl -c env/constraints.txt`. verl's own
+# metadata leaves torch and vllm unpinned, so without these a transitive
+# requirement can move the stack the tandem patches were built against.
+torch==2.10.0
+transformers==5.5.4
+vllm==0.19.1
+numpy>=2.0.0

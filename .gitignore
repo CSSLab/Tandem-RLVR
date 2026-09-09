@@ -1,61 +1,38 @@
-# Byte-code files
-__pycache__/
-*.py[cod]
-*.pyd
-$py.class
+# Upstream forks, reconstructed by third_party/apply_patches.sh
+third_party/vllm/
+third_party/verl/
 
-# Temporary files, build artifacts and distribution
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.manifest
-*.mo
-*.pot
-*.seed
-*.par
+# Site configuration, created from train/env.sh.example
+train/env.sh
 
-# Virtual environment
-# Change "venv" to the name of your virtual environment directory, if it's different.
-venv/
-.venv/
-env/
-.env/
+# Training checkpoints and persisted HF weights
+checkpoints/
+train/checkpoints/
 
-# Data and log files
+# Training data, rebuilt by data/build_deepscaler.py
+data/deepscaler/
+
+# Evaluation and run outputs
+results/
+outputs/
+logs/
 *.log
-*.sql
-*.sqlite
-/local_settings.py # Example for a sensitive config file
+*.out
+wandb/
 
-# OS and editor files (consider using a global gitignore for these)
-.DS_Store # macOS
-.project
-.idea/      # PyCharm
-.vscode/    # VS Code
-thumbs.db   # Windows
-scratch/
-archive/
-cache/
+# Python
+__pycache__/
+*.pyc
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
 
-# vllm source — binary artifacts (keep .py files tracked)
-vllm_source/vllm/*.so
-vllm_source/vllm/**/*.so
-vllm_source/vllm/__pycache__/
-vllm_source/vllm/**/__pycache__/
-verl/run_tandem_grpo_gsm8k.sh
-verl/run_tandem_grpo_gsm8k_sft.sh
-verl/run_tandem_vllm_grpo_gsm8k.sh
-verl/run_tandem_self_step30.sh
+# Editors and OS
+.ipynb_checkpoints/
+.DS_Store
+
+# data/eval/*.parquet is tracked on purpose: those seven files ship with the
+# repository, and data/build_evals.py cannot regenerate the olympiad set.

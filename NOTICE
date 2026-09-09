@@ -1,0 +1,31 @@
+Tandem RLVR
+
+This product includes software developed by third parties, listed below. Each is
+licensed under the Apache License, Version 2.0. A copy of that licence is at
+http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+verl
+Copyright 2024 Bytedance Ltd. and/or its affiliates
+https://github.com/volcengine/verl
+
+third_party/verl-tandem.patch modifies verl at commit
+cbd7f9f462c0230f4f6161462b5b294c9d55d453. The patch is applied to an unmodified
+checkout of that commit; no verl source is redistributed here.
+
+--------------------------------------------------------------------------------
+vLLM
+Copyright 2023 vLLM Team
+https://github.com/vllm-project/vllm
+
+third_party/vllm-tandem.patch modifies vLLM at commit
+b1388b1fbf5aaef47937fabe98931211684666a6, release tag v0.19.1. The patch is
+applied to an unmodified checkout of that commit; no vLLM source is
+redistributed here.
+
+--------------------------------------------------------------------------------
+Boxed answer grader
+Copyright Garena Online Private Limited
+
+reward/hendrycks_math_grader.py is vendored, with modifications, from the
+Oat-Zero / Understand-R1-Zero release. reward/math_boxed_reward.py wraps it.

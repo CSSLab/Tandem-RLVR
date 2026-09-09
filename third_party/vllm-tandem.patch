@@ -1,0 +1,1003 @@
+diff --git a/.gitignore b/.gitignore
+index 7b82216..178d4ff 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -241,3 +241,8 @@ vllm/grpc/vllm_engine_pb2.pyi
+ 
+ # Ignore generated cpu headers 
+ csrc/cpu/cpu_attn_dispatch_generated.h
++
++*.so
++*.egg-info/
++/build/
++vllm/third_party/
+diff --git a/vllm/config/__init__.py b/vllm/config/__init__.py
+index d5a3e9b..fe9c1f8 100644
+--- a/vllm/config/__init__.py
++++ b/vllm/config/__init__.py
+@@ -36,6 +36,7 @@ from vllm.config.profiler import ProfilerConfig
+ from vllm.config.reasoning import ReasoningConfig
+ from vllm.config.scheduler import SchedulerConfig
+ from vllm.config.speculative import SpeculativeConfig
++from vllm.config.tandem import TandemConfig, TandemSelectionStrategy
+ from vllm.config.speech_to_text import SpeechToTextConfig
+ from vllm.config.structured_outputs import StructuredOutputsConfig
+ from vllm.config.utils import (
+@@ -108,6 +109,8 @@ __all__ = [
+     "SchedulerConfig",
+     # From vllm.config.speculative
+     "SpeculativeConfig",
++    "TandemConfig",
++    "TandemSelectionStrategy",
+     # From vllm.config.speech_to_text
+     "SpeechToTextConfig",
+     # From vllm.config.structured_outputs
+diff --git a/vllm/config/tandem.py b/vllm/config/tandem.py
+new file mode 100644
+index 0000000..2dc180b
+--- /dev/null
++++ b/vllm/config/tandem.py
+@@ -0,0 +1,114 @@
++
++import hashlib
++from dataclasses import dataclass
++from typing import Any, Literal, Optional
++
++from vllm.config.model import ModelConfig
++from vllm.config.parallel import ParallelConfig
++
++TandemSelectionStrategy = Literal[
++    "bernoulli", "chunk", "alternating", "sentence", "word"]
++
++VALID_STRATEGIES = ("bernoulli", "chunk", "alternating", "sentence", "word")
++BOUNDARY_STRATEGIES = ("sentence", "word")
++
++
++@dataclass
++class TandemConfig:
++
++    enabled: bool = False
++    frozen_model: Optional[str] = None
++    frozen_model_revision: Optional[str] = None
++    selection_strategy: TandemSelectionStrategy = "bernoulli"
++    prob_primary: float = 0.5
++    frozen_tensor_parallel_size: int = 1
++    frozen_gpu_devices: Optional[list[int]] = None
++    frozen_gpu_memory_utilization: float = 0.9
++    frozen_dtype: Optional[str] = None
++    frozen_quantization: Optional[str] = None
++    frozen_enforce_eager: Optional[bool] = None
++    frozen_max_model_len: Optional[int] = None
++    boundary_token_ids: Optional[list[int]] = None
++    boundary_token_ids_path: Optional[str] = None
++    chunk_size: int = 1
++    max_gap_tokens: int = 32
++    target_model_config: Optional[ModelConfig] = None
++    target_parallel_config: Optional[ParallelConfig] = None
++
++    def __post_init__(self):
++        self._load_boundary_ids_file()
++        self._validate_basic()
++        self._validate_strategy()
++        if self.target_parallel_config is not None and self.enabled:
++            self._validate_parallelism()
++
++    def _load_boundary_ids_file(self):
++        if self.boundary_token_ids is None and self.boundary_token_ids_path:
++            import json
++            with open(self.boundary_token_ids_path) as f:
++                ids = json.load(f)
++            if (not isinstance(ids, list)
++                    or not all(isinstance(i, int) for i in ids)):
++                raise ValueError(
++                    f"boundary_token_ids_path must point to a JSON list of "
++                    f"ints, got {self.boundary_token_ids_path}")
++            self.boundary_token_ids = ids
++
++    def _validate_basic(self):
++        if self.enabled and self.frozen_model is None:
++            raise ValueError(
++                "tandem_config.frozen_model must be set when tandem is enabled")
++        if not 0.0 <= self.prob_primary <= 1.0:
++            raise ValueError(
++                f"prob_primary must be in [0, 1], got {self.prob_primary}")
++
++    def _validate_strategy(self):
++        if self.selection_strategy not in VALID_STRATEGIES:
++            raise ValueError(
++                f"Invalid selection_strategy: {self.selection_strategy}")
++        if self.selection_strategy in BOUNDARY_STRATEGIES \
++                and not self.boundary_token_ids:
++            raise ValueError(
++                f"boundary_token_ids required for "
++                f"{self.selection_strategy} strategy")
++        if self.selection_strategy == "word" and self.max_gap_tokens < 1:
++            raise ValueError(
++                f"max_gap_tokens must be >= 1 for word strategy, "
++                f"got {self.max_gap_tokens}")
++
++    def _validate_parallelism(self):
++        pc = self.target_parallel_config
++        primary_tp = pc.tensor_parallel_size
++        if self.frozen_tensor_parallel_size == 1 and primary_tp > 1:
++            self.frozen_tensor_parallel_size = primary_tp
++        if self.frozen_tensor_parallel_size != primary_tp:
++            raise ValueError(
++                f"frozen_tensor_parallel_size "
++                f"({self.frozen_tensor_parallel_size}) must match primary "
++                f"tensor_parallel_size ({primary_tp})")
++        if self.frozen_gpu_devices is not None \
++                and len(self.frozen_gpu_devices) != primary_tp:
++            raise ValueError(
++                f"frozen_gpu_devices length "
++                f"({len(self.frozen_gpu_devices)}) must match "
++                f"tensor_parallel_size ({primary_tp})")
++        if pc.pipeline_parallel_size > 1:
++            raise ValueError(
++                "Tandem generation does not support pipeline "
++                "parallelism (pp > 1)")
++
++    @classmethod
++    def from_dict(cls, dict_value: dict) -> "TandemConfig":
++        return cls(**dict_value)
++
++    def compute_hash(self) -> str:
++        factors: list[Any] = [
++            self.enabled,
++            self.frozen_model,
++            self.selection_strategy,
++            self.prob_primary,
++            self.frozen_tensor_parallel_size,
++            len(self.boundary_token_ids) if self.boundary_token_ids else 0,
++        ]
++        return hashlib.md5(str(factors).encode(),
++                           usedforsecurity=False).hexdigest()
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index cbd7ad0..cb2447f 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -45,6 +45,7 @@ from .profiler import ProfilerConfig
+ from .reasoning import ReasoningConfig
+ from .scheduler import SchedulerConfig
+ from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
++from .tandem import TandemConfig
+ from .structured_outputs import StructuredOutputsConfig
+ from .utils import SupportsHash, config, replace
+ from .weight_transfer import WeightTransferConfig
+@@ -279,6 +280,8 @@ class VllmConfig:
+     """LoRA configuration."""
+     speculative_config: SpeculativeConfig | None = None
+     """Speculative decoding configuration."""
++    tandem_config: TandemConfig | None = None
++    """Tandem (dual-model) co-generation configuration."""
+     structured_outputs_config: StructuredOutputsConfig = Field(
+         default_factory=StructuredOutputsConfig
+     )
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index e1772ab..2a00aad 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -57,6 +57,7 @@ from vllm.config import (
+     SchedulerConfig,
+     SpeculativeConfig,
+     StructuredOutputsConfig,
++    TandemConfig,
+     UVAOffloadConfig,
+     VllmConfig,
+     WeightTransferConfig,
+@@ -546,6 +547,8 @@ class EngineArgs:
+ 
+     speculative_config: dict[str, Any] | None = None
+ 
++    tandem_config: dict[str, Any] | None = None
++
+     show_hidden_metrics_for_version: str | None = (
+         ObservabilityConfig.show_hidden_metrics_for_version
+     )
+@@ -1513,6 +1516,26 @@ class EngineArgs:
+         )
+         return SpeculativeConfig(**self.speculative_config)
+ 
++    def create_tandem_config(
++        self,
++        target_model_config: ModelConfig,
++        target_parallel_config: ParallelConfig,
++    ) -> TandemConfig | None:
++        cfg = self.tandem_config
++        if cfg is None:
++            import os
++            env_cfg = os.environ.get("VLLM_TANDEM_CONFIG")
++            cfg = json.loads(env_cfg) if env_cfg else None
++        if cfg is None:
++            return None
++        cfg.update(
++            {
++                "target_model_config": target_model_config,
++                "target_parallel_config": target_parallel_config,
++            }
++        )
++        return TandemConfig.from_dict(cfg)
++
+     def create_engine_config(
+         self,
+         usage_context: UsageContext | None = None,
+@@ -1806,6 +1829,16 @@ class EngineArgs:
+             target_parallel_config=parallel_config,
+         )
+ 
++        tandem_config = self.create_tandem_config(
++            target_model_config=model_config,
++            target_parallel_config=parallel_config,
++        )
++        if tandem_config is not None and speculative_config is not None:
++            raise ValueError(
++                "Tandem generation and speculative decoding cannot be "
++                "used simultaneously."
++            )
++
+         assert self.max_num_batched_tokens is not None, (
+             "max_num_batched_tokens must be set by this point"
+         )
+@@ -1976,6 +2009,7 @@ class EngineArgs:
+             kernel_config=kernel_config,
+             lora_config=lora_config,
+             speculative_config=speculative_config,
++            tandem_config=tandem_config,
+             structured_outputs_config=self.structured_outputs_config,
+             observability_config=observability_config,
+             compilation_config=compilation_config,
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index 2c71d2a..cfc63b6 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -46,6 +46,8 @@ class CompletionOutput:
+     finish_reason: str | None = None
+     stop_reason: int | str | None = None
+     lora_request: LoRARequest | None = None
++    tandem_model_mask: list[int] | None = None
++    tandem_partner_logprob: list[float] | None = None
+ 
+     def finished(self) -> bool:
+         return self.finish_reason is not None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index fe524cc..46c1ab9 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1305,6 +1305,8 @@ class Scheduler(SchedulerInterface):
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
+         sampled_token_ids = model_runner_output.sampled_token_ids
++        tandem_model_mask_all = model_runner_output.tandem_model_mask
++        tandem_partner_lp_all = model_runner_output.tandem_partner_logprob
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+@@ -1362,6 +1364,14 @@ class Scheduler(SchedulerInterface):
+             generated_token_ids = (
+                 sampled_token_ids[req_index] if sampled_token_ids else []
+             )
++            req_tandem_mask = (
++                tandem_model_mask_all[req_index]
++                if tandem_model_mask_all else None
++            )
++            req_tandem_partner_lp = (
++                tandem_partner_lp_all[req_index]
++                if tandem_partner_lp_all else None
++            )
+ 
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+@@ -1459,6 +1469,8 @@ class Scheduler(SchedulerInterface):
+                     EngineCoreOutput(
+                         request_id=req_id,
+                         new_token_ids=new_token_ids,
++                        tandem_model_mask=req_tandem_mask,
++                        tandem_partner_logprob=req_tandem_partner_lp,
+                         finish_reason=finish_reason,
+                         new_logprobs=new_logprobs,
+                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index 114d45f..ccb33df 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -145,6 +145,8 @@ class EngineCoreOutput(
+ ):  # type: ignore[call-arg]
+     request_id: str
+     new_token_ids: list[int]
++    tandem_model_mask: list[int] | None = None
++    tandem_partner_logprob: list[float] | None = None
+ 
+     new_logprobs: LogprobsLists | None = None
+     new_prompt_logprobs_tensors: LogprobsTensors | None = None
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index f9e9650..979ff8e 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -172,6 +172,8 @@ class RequestState:
+         self.is_prefilling = True
+         self.queue = queue
+         self.num_cached_tokens = 0
++        self.tandem_model_mask: list[int] = []
++        self.tandem_partner_logprob: list[float] = []
+ 
+         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+ 
+@@ -395,10 +397,19 @@ class RequestState:
+         if delta and logprobs:
+             logprobs = logprobs[-len(token_ids) :]
+ 
++        tandem_mask = self.tandem_model_mask
++        if delta and tandem_mask:
++            tandem_mask = tandem_mask[-len(token_ids):]
++        tandem_partner_lp = self.tandem_partner_logprob
++        if delta and tandem_partner_lp:
++            tandem_partner_lp = tandem_partner_lp[-len(token_ids):]
++
+         return CompletionOutput(
+             index=self.request_index,
+             text=text,
+             token_ids=token_ids,
++            tandem_model_mask=tandem_mask or None,
++            tandem_partner_logprob=tandem_partner_lp or None,
+             routed_experts=routed_experts,
+             logprobs=logprobs,
+             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
+@@ -612,6 +623,12 @@ class OutputProcessor:
+             )
+ 
+             new_token_ids = engine_core_output.new_token_ids
++            if engine_core_output.tandem_model_mask:
++                req_state.tandem_model_mask.extend(
++                    engine_core_output.tandem_model_mask)
++            if engine_core_output.tandem_partner_logprob:
++                req_state.tandem_partner_logprob.extend(
++                    engine_core_output.tandem_partner_logprob)
+             pooling_output = engine_core_output.pooling_output
+             finish_reason = engine_core_output.finish_reason
+             stop_reason = engine_core_output.stop_reason
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 8eb58de..0aed7a6 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -227,6 +227,10 @@ class ModelRunnerOutput:
+     # each request due to speculative/jump decoding.
+     sampled_token_ids: list[list[int]] = field(default_factory=list)
+ 
++    tandem_model_mask: list[list[int]] | None = None
++
++    tandem_partner_logprob: list[list[float]] | None = None
++
+     # [num_reqs, max_num_logprobs + 1]
+     # [num_reqs, max_num_logprobs + 1]
+     # [num_reqs]
+diff --git a/vllm/v1/sample/tandem_sampler.py b/vllm/v1/sample/tandem_sampler.py
+new file mode 100644
+index 0000000..121335a
+--- /dev/null
++++ b/vllm/v1/sample/tandem_sampler.py
+@@ -0,0 +1,183 @@
++
++import torch
++import torch.nn as nn
++
++from vllm.config import TandemConfig
++from vllm.logger import init_logger
++from vllm.v1.outputs import LogprobsTensors, SamplerOutput
++from vllm.v1.sample.metadata import SamplingMetadata
++from vllm.v1.sample.sampler import Sampler
++
++logger = init_logger(__name__)
++
++
++class TandemSampler(nn.Module):
++
++    def __init__(self, tandem_config: TandemConfig):
++        super().__init__()
++        self.strategy = tandem_config.selection_strategy
++        self.prob_primary = tandem_config.prob_primary
++        self.chunk_size = max(1, getattr(tandem_config, "chunk_size", 1))
++        self.max_gap_tokens = max(1, getattr(tandem_config, "max_gap_tokens", 32))
++        self.sampler = Sampler()
++        self._step = 0
++        self._word_state: dict = {}
++        self.boundary_token_ids: frozenset[int] = (
++            frozenset(tandem_config.boundary_token_ids)
++            if tandem_config.boundary_token_ids else frozenset())
++
++    def forward(self, primary_logits: torch.Tensor,
++                frozen_logits: torch.Tensor,
++                sampling_metadata: SamplingMetadata,
++                force_primary: torch.Tensor | None = None,
++                req_ids: list | None = None,
++                output_token_ids: list | None = None,
++                ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
++        batch_size = primary_logits.shape[0]
++        frozen_logits = frozen_logits.to(primary_logits.device)
++        primary_output = self.sampler(primary_logits.clone(), sampling_metadata)
++        frozen_output = self.sampler(frozen_logits.clone(), sampling_metadata)
++        primary_tokens = primary_output.sampled_token_ids.squeeze(-1)
++        frozen_tokens = frozen_output.sampled_token_ids.squeeze(-1)
++        use_primary = self._select(batch_size, primary_logits.device,
++                                   sampling_metadata, req_ids,
++                                   output_token_ids)
++        if force_primary is not None:
++            use_primary = use_primary | force_primary.to(use_primary.device)
++        chosen_tokens = torch.where(use_primary, primary_tokens, frozen_tokens)
++        if self.strategy == "word" and req_ids is not None:
++            self._word_post_update(req_ids, chosen_tokens.tolist(),
++                                   use_primary.tolist(), sampling_metadata)
++        model_mask = use_primary.to(torch.int32)
++        frozen_logprobs = torch.log_softmax(frozen_logits, dim=-1)
++        partner_logprob = frozen_logprobs.gather(
++            1, chosen_tokens.unsqueeze(-1)).squeeze(-1)
++        logprobs_tensors = self._merge_logprobs(
++            primary_output.logprobs_tensors,
++            frozen_output.logprobs_tensors, use_primary)
++        self._step += 1
++        sampler_output = SamplerOutput(
++            sampled_token_ids=chosen_tokens.unsqueeze(-1),
++            logprobs_tensors=logprobs_tensors)
++        return sampler_output, model_mask, partner_logprob
++
++    def _merge_logprobs(self, primary_lp, frozen_lp, use_primary):
++        if primary_lp is None or frozen_lp is None:
++            return primary_lp
++        sel = use_primary.view(-1, 1)
++        return LogprobsTensors(
++            torch.where(sel, primary_lp.logprob_token_ids,
++                        frozen_lp.logprob_token_ids),
++            torch.where(sel, primary_lp.logprobs, frozen_lp.logprobs),
++            torch.where(use_primary, primary_lp.selected_token_ranks,
++                        frozen_lp.selected_token_ranks))
++
++    def _select(self, batch_size: int, device: torch.device,
++                sampling_metadata: SamplingMetadata,
++                req_ids: list | None = None,
++                output_token_ids: list | None = None) -> torch.Tensor:
++        if self.strategy == "bernoulli":
++            return torch.rand(batch_size, device=device) < self.prob_primary
++        elif self.strategy == "chunk":
++            return self._chunk_select(batch_size, device)
++        elif self.strategy == "alternating":
++            return torch.full((batch_size,), self._step % 2 == 0,
++                              dtype=torch.bool, device=device)
++        elif self.strategy == "sentence":
++            return self._sentence_select(batch_size, device, sampling_metadata,
++                                         output_token_ids)
++        elif self.strategy == "word":
++            return self._word_select(batch_size, device, sampling_metadata,
++                                     req_ids, output_token_ids)
++        raise ValueError(f"Unknown strategy: {self.strategy}")
++
++    def _rows(self, sampling_metadata, output_token_ids, batch_size):
++        rows = (output_token_ids if output_token_ids is not None
++                else sampling_metadata.output_token_ids)
++        if len(rows) != batch_size and not getattr(self, "_rows_warned", False):
++            self._rows_warned = True
++            logger.warning(
++                "TandemSampler: %d output-token rows for batch of %d; "
++                "missing rows default to the primary author",
++                len(rows), batch_size)
++        return rows
++
++    def _sentence_select(self, batch_size: int, device: torch.device,
++                         sampling_metadata: SamplingMetadata,
++                         output_token_ids: list | None = None) -> torch.Tensor:
++        use_primary = torch.ones(batch_size, dtype=torch.bool, device=device)
++        boundary_ids = self.boundary_token_ids
++        rows = self._rows(sampling_metadata, output_token_ids, batch_size)
++        for i, token_ids in enumerate(rows[:batch_size]):
++            n_boundaries = sum(1 for tid in token_ids if tid in boundary_ids)
++            use_primary[i] = (n_boundaries % 2 == 0)
++        return use_primary
++
++    def _word_select(self, batch_size: int, device: torch.device,
++                     sampling_metadata: SamplingMetadata,
++                     req_ids: list | None = None,
++                     output_token_ids: list | None = None) -> torch.Tensor:
++        use_primary = torch.ones(batch_size, dtype=torch.bool, device=device)
++        rows = self._rows(sampling_metadata, output_token_ids, batch_size)
++        for i in range(batch_size):
++            key = req_ids[i] if req_ids is not None else (
++                id(rows[i]) if i < len(rows) else i)
++            st = self._word_state.get(key)
++            if st is None:
++                prefix = rows[i] if i < len(rows) else []
++                st = self._word_replay(prefix, sampling_metadata, i)
++                self._word_state[key] = st
++            use_primary[i] = st[0]
++        if req_ids is not None:
++            live = set(req_ids)
++            self._word_state = {k: v for k, v in self._word_state.items()
++                                if k in live}
++        return use_primary
++
++    def _word_replay(self, prefix, sampling_metadata, i):
++        author = self._draw_active(sampling_metadata, i, self.prob_primary)
++        since = 0
++        for tid in prefix:
++            if tid < 0:
++                continue
++            since += 1
++            if tid in self.boundary_token_ids or since >= self.max_gap_tokens:
++                author = self._draw_active(sampling_metadata, i,
++                                           self.prob_primary)
++                since = 0
++        return [author, since]
++
++    def _word_post_update(self, req_ids, chosen_tokens, use_primary_rows,
++                          sampling_metadata):
++        for i, key in enumerate(req_ids):
++            st = self._word_state.get(key)
++            if st is None:
++                continue
++            tid = chosen_tokens[i]
++            if isinstance(tid, list):
++                tid = tid[0]
++            st[1] += 1
++            if tid in self.boundary_token_ids or st[1] >= self.max_gap_tokens:
++                st[0] = self._draw_active(sampling_metadata, i,
++                                          self.prob_primary)
++                st[1] = 0
++
++    def _draw_active(self, sampling_metadata: SamplingMetadata, i: int,
++                     p: float) -> bool:
++        gen = sampling_metadata.generators.get(i)
++        if gen is not None:
++            draw = torch.rand(1, generator=gen, device=gen.device).item()
++        else:
++            draw = float(torch.rand(1).item())
++        return draw < p
++
++    def _chunk_select(self, batch_size: int,
++                      device: torch.device) -> torch.Tensor:
++        pos = self._step % (2 * self.chunk_size)
++        is_primary = pos < self.chunk_size
++        return torch.full((batch_size,), is_primary, dtype=torch.bool,
++                          device=device)
++
++    def reset(self):
++        self._step = 0
++        self._word_state = {}
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 2e62206..3dbfa98 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -218,6 +218,28 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+ 
+ 
+ # Wrapper for ModelRunnerOutput to support overlapped execution.
++def _tandem_mask_to_list(mask, valid_sampled_token_ids):
++    if mask is None:
++        return None
++    mask_list = mask.tolist()
++    out = []
++    for i, toks in enumerate(valid_sampled_token_ids):
++        m = int(mask_list[i]) if i < len(mask_list) else 1
++        out.append([m] * len(toks) if toks else [])
++    return out
++
++
++def _tandem_lp_to_list(lp, valid_sampled_token_ids):
++    if lp is None:
++        return None
++    lp_list = lp.tolist()
++    out = []
++    for i, toks in enumerate(valid_sampled_token_ids):
++        v = float(lp_list[i]) if i < len(lp_list) else 0.0
++        out.append([v] * len(toks) if toks else [])
++    return out
++
++
+ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+     def __init__(
+         self,
+@@ -227,9 +249,13 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         invalid_req_indices: list[int],
+         async_output_copy_stream: torch.cuda.Stream,
+         vocab_size: int,
++        tandem_mask=None,
++        tandem_partner_logprob=None,
+     ):
+         self._model_runner_output = model_runner_output
+         self._invalid_req_indices = invalid_req_indices
++        self._tandem_mask = tandem_mask
++        self._tandem_partner_logprob = tandem_partner_logprob
+ 
+         # Event on the copy stream so we can synchronize the non-blocking copy.
+         self.async_copy_ready_event = torch.Event()
+@@ -283,6 +309,12 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         output = self._model_runner_output
+         output.sampled_token_ids = valid_sampled_token_ids
+         output.logprobs = logprobs_lists
++        if self._tandem_mask is not None:
++            output.tandem_model_mask = _tandem_mask_to_list(
++                self._tandem_mask, valid_sampled_token_ids)
++        if self._tandem_partner_logprob is not None:
++            output.tandem_partner_logprob = _tandem_lp_to_list(
++                self._tandem_partner_logprob, valid_sampled_token_ids)
+         return output
+ 
+ 
+@@ -3327,6 +3359,9 @@ class GPUModelRunner(
+         # if async scheduling and required by current sampling params.
+         self.input_batch.update_async_output_token_ids()
+         if spec_decode_metadata is None:
++            tandem_out = self._maybe_tandem_sample(logits, sampling_metadata)
++            if tandem_out is not None:
++                return tandem_out
+             return self.sampler(
+                 logits=logits,
+                 sampling_metadata=sampling_metadata,
+@@ -4068,6 +4103,12 @@ class GPUModelRunner(
+ 
+                 sample_hidden_states = hidden_states[logits_indices]
+                 logits = self.model.compute_logits(sample_hidden_states)
++                frozen_input_ids = (
++                    input_ids if input_ids is not None
++                    else self.input_ids.gpu[:positions.shape[0]])
++                self._tandem_compute_frozen(
++                    frozen_input_ids, positions, attn_metadata,
++                    num_scheduled_tokens, logits_indices, slot_mappings)
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+@@ -4314,10 +4355,18 @@ class GPUModelRunner(
+                 else:
+                     logger.error("RoutedExpertsCapturer not initialized.")
+ 
++            tandem_mask_tensor = getattr(self, "_tandem_mask", None)
++            tandem_tlp_tensor = getattr(self, "_tandem_partner_logprob", None)
++            self._tandem_mask = None
++            self._tandem_partner_logprob = None
+             output = ModelRunnerOutput(
+                 req_ids=req_ids_output_copy,
+                 req_id_to_index=req_id_to_index_output_copy,
+                 sampled_token_ids=valid_sampled_token_ids,
++                tandem_model_mask=_tandem_mask_to_list(
++                    tandem_mask_tensor, valid_sampled_token_ids),
++                tandem_partner_logprob=_tandem_lp_to_list(
++                    tandem_tlp_tensor, valid_sampled_token_ids),
+                 logprobs=logprobs_lists,
+                 prompt_logprobs_dict=prompt_logprobs_dict,
+                 kv_connector_output=kv_connector_output,
+@@ -4341,6 +4390,8 @@ class GPUModelRunner(
+                 invalid_req_indices=invalid_req_indices,
+                 async_output_copy_stream=self.async_output_copy_stream,
+                 vocab_size=self.input_batch.vocab_size,
++                tandem_mask=tandem_mask_tensor,
++                tandem_partner_logprob=tandem_tlp_tensor,
+             )
+         with record_function_or_nullcontext(
+             "gpu_model_runner: set_async_sampled_token_ids"
+@@ -6817,6 +6868,73 @@ class GPUModelRunner(
+             else:
+                 kv_transfer_group.register_kv_caches(kv_caches)
+             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
++        self.maybe_init_frozen_kv_cache(kv_cache_config)
++
++    def maybe_load_frozen_model(self) -> None:
++        tc = getattr(self.vllm_config, "tandem_config", None)
++        if tc is None or not tc.enabled:
++            self.tandem_manager = None
++            self.tandem_sampler = None
++            return
++        from vllm.v1.worker.tandem import TandemModelManager
++        from vllm.v1.sample.tandem_sampler import TandemSampler
++        self.tandem_manager = TandemModelManager(tc, self.vllm_config)
++        self.tandem_manager.load_frozen_model()
++        self.tandem_sampler = TandemSampler(tc)
++        self._tandem_frozen_logits = None
++        self._tandem_mask = None
++        self._tandem_partner_logprob = None
++
++    def maybe_init_frozen_kv_cache(self, kv_cache_config) -> None:
++        mgr = getattr(self, "tandem_manager", None)
++        if mgr is None:
++            return
++        attn_backend = self.attn_groups[0][0].backend
++        mgr.initialize_frozen_kv_cache(kv_cache_config, attn_backend)
++
++    def _tandem_compute_frozen(self, input_ids, positions, attn_metadata,
++                               num_scheduled_tokens, logits_indices,
++                               slot_mappings) -> None:
++        mgr = getattr(self, "tandem_manager", None)
++        if mgr is None:
++            self._tandem_frozen_logits = None
++            return
++        self._tandem_frozen_logits = mgr.frozen_forward(
++            input_ids, positions, attn_metadata, num_scheduled_tokens,
++            logits_indices, slot_mappings)
++
++    def _maybe_tandem_sample(self, logits, sampling_metadata):
++        mgr = getattr(self, "tandem_manager", None)
++        frozen_logits = getattr(self, "_tandem_frozen_logits", None)
++        if mgr is None or frozen_logits is None:
++            return None
++        force_primary = self._tandem_force_primary(logits.shape[0], logits.device)
++        req_ids = self.input_batch.req_ids
++        out_tok = None
++        if not req_ids or len(req_ids) != logits.shape[0]:
++            req_ids = None
++        else:
++            out_tok = [self.requests[rid].output_token_ids for rid in req_ids]
++        sampler_output, mask, partner_logprob = self.tandem_sampler.forward(
++            logits, frozen_logits, sampling_metadata, force_primary=force_primary,
++            req_ids=req_ids, output_token_ids=out_tok)
++        self._tandem_frozen_logits = None
++        self._tandem_mask = mask
++        self._tandem_partner_logprob = partner_logprob
++        return sampler_output
++
++    def _tandem_force_primary(self, batch_size, device):
++        req_ids = self.input_batch.req_ids
++        if not req_ids or len(req_ids) != batch_size:
++            return None
++        flags = []
++        for rid in req_ids:
++            rs = self.requests.get(rid)
++            ea = rs.sampling_params.extra_args if rs and rs.sampling_params else None
++            flags.append(bool(ea) and bool(ea.get("tandem_disabled", False)))
++        if not any(flags):
++            return None
++        return torch.tensor(flags, dtype=torch.bool, device=device)
+ 
+     def _get_attention_kv_cache_gid(self) -> int:
+         """Find the KV cache group index for attention layers."""
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 91dcdc2..ccbdd60 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -321,6 +321,7 @@ class Worker(WorkerBase):
+             set_current_vllm_config(self.vllm_config),
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
++        self.model_runner.maybe_load_frozen_model()
+ 
+     def update_config(self, overrides: dict[str, Any]) -> None:
+         self.model_runner.update_config(overrides)
+diff --git a/vllm/v1/worker/tandem.py b/vllm/v1/worker/tandem.py
+new file mode 100644
+index 0000000..bd6edd4
+--- /dev/null
++++ b/vllm/v1/worker/tandem.py
+@@ -0,0 +1,239 @@
++
++import copy
++import time
++from contextlib import nullcontext
++from typing import Any, Optional
++
++import torch
++from torch import nn
++
++from vllm.model_executor.layers.attention import Attention
++from vllm.config import TandemConfig, VllmConfig, set_current_vllm_config
++from vllm.distributed.parallel_state import (
++    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
++from vllm.forward_context import set_forward_context
++from vllm.logger import init_logger
++from vllm.model_executor.model_loader import DefaultModelLoader
++from vllm.model_executor.model_loader.utils import initialize_model
++from vllm.utils.torch_utils import set_default_torch_dtype
++
++logger = init_logger(__name__)
++
++FROZEN_PREFIX = "tandem_frozen."
++
++
++def is_frozen_layer(layer_name: str) -> bool:
++    return layer_name.startswith(FROZEN_PREFIX)
++
++
++def _frozen_tp_context():
++    return nullcontext()
++
++
++class TandemModelManager:
++
++    def __init__(self, tandem_config: TandemConfig,
++                 primary_vllm_config: VllmConfig):
++        self.tandem_config = tandem_config
++        self.primary_vllm_config = primary_vllm_config
++        self.frozen_model: Optional[nn.Module] = None
++        self.frozen_device: Optional[torch.device] = None
++        self.frozen_kv_caches: list[torch.Tensor] = []
++        self.frozen_layer_names: list[str] = []
++
++    def _build_frozen_vllm_config(self) -> VllmConfig:
++        tc = self.tandem_config
++        primary = self.primary_vllm_config
++        saved_sfc = primary.compilation_config.static_forward_context
++        primary.compilation_config.static_forward_context = {}
++        try:
++            frozen_config = copy.deepcopy(primary)
++        finally:
++            primary.compilation_config.static_forward_context = saved_sfc
++        if tc.frozen_model != primary.model_config.model:
++            frozen_config.model_config.model = tc.frozen_model
++            if tc.frozen_model_revision:
++                frozen_config.model_config.revision = tc.frozen_model_revision
++            from vllm.transformers_utils.config import (get_config,
++                                                        get_hf_text_config)
++            frozen_hf_config = get_config(
++                tc.frozen_model,
++                trust_remote_code=frozen_config.model_config.trust_remote_code,
++                revision=tc.frozen_model_revision,
++            )
++            frozen_config.model_config.hf_config = frozen_hf_config
++            frozen_config.model_config.hf_text_config = get_hf_text_config(
++                frozen_hf_config)
++        if tc.frozen_quantization:
++            frozen_config.model_config.quantization = tc.frozen_quantization
++        if tc.frozen_max_model_len:
++            frozen_config.model_config.max_model_len = tc.frozen_max_model_len
++        frozen_config.load_config.load_format = "auto"
++        frozen_config.device_config.device = self.frozen_device
++        frozen_config.device_config.device_type = self.frozen_device.type
++        return frozen_config
++
++    def _resolve_frozen_device(self) -> torch.device:
++        tc = self.tandem_config
++        tp_rank = get_tensor_model_parallel_rank()
++        tp_size = get_tensor_model_parallel_world_size()
++        if tc.frozen_gpu_devices:
++            device_id = tc.frozen_gpu_devices[tp_rank]
++        else:
++            device_id = tp_rank + tp_size
++        return torch.device(f"cuda:{device_id}")
++
++    def load_frozen_model(self) -> None:
++        tc = self.tandem_config
++        if not tc.enabled:
++            return
++        self.frozen_device = self._resolve_frozen_device()
++        logger.info("Loading frozen tandem model %s on %s (TP rank %d)...",
++                    tc.frozen_model, self.frozen_device,
++                    get_tensor_model_parallel_rank())
++        frozen_vllm_config = self._build_frozen_vllm_config()
++        loader = DefaultModelLoader(frozen_vllm_config.load_config)
++        time_before = time.perf_counter()
++        with set_default_torch_dtype(frozen_vllm_config.model_config.dtype):
++            with torch.device(self.frozen_device):
++                with set_current_vllm_config(frozen_vllm_config):
++                    with _frozen_tp_context():
++                        self.frozen_model = initialize_model(
++                            vllm_config=frozen_vllm_config, prefix=FROZEN_PREFIX)
++            self.frozen_model.load_weights(
++                loader.get_all_weights(frozen_vllm_config.model_config,
++                                       self.frozen_model))
++        self.frozen_model.eval()
++        for param in self.frozen_model.parameters():
++            param.requires_grad_(False)
++        merged = self._merge_frozen_layers(frozen_vllm_config)
++        elapsed = time.perf_counter() - time_before
++        logger.info("Frozen tandem model loaded on %s in %.2fs (%d attn merged)",
++                    self.frozen_device, elapsed, merged)
++
++    def _merge_frozen_layers(self, frozen_vllm_config: VllmConfig) -> int:
++        frozen_sfc = frozen_vllm_config.compilation_config.static_forward_context
++        primary_sfc = \
++            self.primary_vllm_config.compilation_config.static_forward_context
++        count = 0
++        for name, layer in frozen_sfc.items():
++            if is_frozen_layer(name) and name not in primary_sfc:
++                primary_sfc[name] = layer
++                count += 1
++        return count
++
++    def initialize_frozen_kv_cache(self, primary_kv_cache_config: Any,
++                                   attn_backend: Any) -> None:
++        if self.frozen_model is None:
++            return
++        from vllm.v1.worker.utils import bind_kv_cache
++        sfc = self.primary_vllm_config.compilation_config.static_forward_context
++        frozen_layers = {
++            name: layer for name, layer in sfc.items()
++            if is_frozen_layer(name) and isinstance(layer, Attention)
++        }
++        if not frozen_layers:
++            logger.warning("No frozen attention layers in static_forward_context")
++            return
++        self.frozen_layer_names = list(frozen_layers.keys())
++        num_blocks = primary_kv_cache_config.num_blocks
++        block_size = self.primary_vllm_config.cache_config.block_size
++        kv_cache_dtype = self.primary_vllm_config.cache_config.cache_dtype
++        if kv_cache_dtype == "auto":
++            kv_cache_dtype = self.primary_vllm_config.model_config.dtype
++        frozen_kv_caches = self._alloc_frozen_caches(frozen_layers, attn_backend,
++                                                     num_blocks, block_size,
++                                                     kv_cache_dtype)
++        bind_kv_cache(frozen_kv_caches, sfc, self.frozen_kv_caches)
++        logger.info("Frozen tandem KV cache: %d layers, %d blocks on %s",
++                    len(frozen_kv_caches), num_blocks, self.frozen_device)
++
++    def _alloc_frozen_caches(self, frozen_layers, attn_backend, num_blocks,
++                             block_size, kv_cache_dtype) -> dict:
++        frozen_kv_caches: dict[str, torch.Tensor] = {}
++        shared: dict[str, str] = {}
++        for layer_name, attn_module in frozen_layers.items():
++            target = getattr(attn_module, "kv_sharing_target_layer_name", None)
++            if target is not None:
++                shared[layer_name] = target
++                continue
++            shape = attn_backend.get_kv_cache_shape(
++                num_blocks, block_size, attn_module.num_kv_heads,
++                attn_module.head_size)
++            frozen_kv_caches[layer_name] = torch.zeros(
++                shape, dtype=kv_cache_dtype, device=self.frozen_device)
++        for layer_name, target in shared.items():
++            if target in frozen_kv_caches:
++                frozen_kv_caches[layer_name] = frozen_kv_caches[target]
++        return frozen_kv_caches
++
++    def frozen_forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
++                       attn_metadata: Any, num_scheduled_tokens: int,
++                       logits_indices: torch.Tensor,
++                       slot_mappings: Any) -> torch.Tensor:
++        with torch.cuda.device(self.frozen_device):
++            return self._frozen_forward_impl(input_ids, positions,
++                                             attn_metadata, num_scheduled_tokens,
++                                             logits_indices, slot_mappings)
++
++    def _frozen_forward_impl(self, input_ids: torch.Tensor,
++                             positions: torch.Tensor, attn_metadata: Any,
++                             num_scheduled_tokens: int,
++                             logits_indices: torch.Tensor,
++                             slot_mappings: Any) -> torch.Tensor:
++        frozen_input_ids = input_ids.to(self.frozen_device)
++        frozen_positions = positions.to(self.frozen_device)
++        frozen_logits_indices = logits_indices.to(self.frozen_device)
++        frozen_attn_metadata = self._adapt_attn_metadata(attn_metadata)
++        frozen_slot_mapping = self._adapt_slot_mapping(slot_mappings)
++        model = getattr(self.frozen_model, "language_model", self.frozen_model)
++        with _frozen_tp_context():
++            with set_forward_context(frozen_attn_metadata,
++                                     self.primary_vllm_config,
++                                     slot_mapping=frozen_slot_mapping):
++                hidden_states = model(
++                    input_ids=frozen_input_ids, positions=frozen_positions,
++                    intermediate_tensors=None, inputs_embeds=None)
++            hidden_states = hidden_states[:num_scheduled_tokens]
++            sample_hidden_states = hidden_states[frozen_logits_indices]
++            frozen_logits = model.compute_logits(sample_hidden_states)
++        return frozen_logits
++
++    def _bare_layer(self, frozen_name: str) -> str:
++        prefix = FROZEN_PREFIX + "."
++        return frozen_name[len(prefix):] if frozen_name.startswith(prefix) else frozen_name
++
++    def _adapt_attn_metadata(self, primary_metadata: Any) -> Any:
++        if isinstance(primary_metadata, dict):
++            adapted = {k: self._adapt_one(v) for k, v in primary_metadata.items()}
++            rep = next(iter(adapted.values()))
++            names = self.frozen_layer_names or [
++                FROZEN_PREFIX + "." + k for k in primary_metadata]
++            return {n: adapted.get(self._bare_layer(n), rep) for n in names}
++        return self._adapt_one(primary_metadata)
++
++    def _adapt_one(self, md: Any) -> Any:
++        adapted = copy.copy(md)
++        for name, val in list(vars(md).items()):
++            if isinstance(val, torch.Tensor):
++                setattr(adapted, name, val.to(self.frozen_device))
++        return adapted
++
++    def _adapt_slot_mapping(self, slot_mappings: Any) -> Any:
++        if not isinstance(slot_mappings, dict):
++            return slot_mappings
++        adapted = {k: v.to(self.frozen_device) for k, v in slot_mappings.items()}
++        rep = next(iter(adapted.values()))
++        names = self.frozen_layer_names or [
++            FROZEN_PREFIX + "." + k for k in slot_mappings]
++        return {n: adapted.get(self._bare_layer(n), rep) for n in names}
++
++    def get_frozen_model(self) -> nn.Module:
++        if self.frozen_model is None:
++            raise RuntimeError("Frozen model not loaded.")
++        return self.frozen_model
++
++    def get_frozen_device(self) -> torch.device:
++        if self.frozen_device is None:
++            raise RuntimeError("Frozen device not set.")
++        return self.frozen_device

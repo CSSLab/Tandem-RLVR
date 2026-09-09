@@ -1,0 +1,339 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 9b618f8..4f881dd 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -144,6 +144,10 @@ class AgentLoopOutput(BaseModel):
+             output["teacher_ids"] = teacher_ids
+         if teacher_logprobs is not None:
+             output["teacher_logprobs"] = teacher_logprobs
++
++        tandem_model_mask = output["extra_fields"].pop("tandem_model_mask", None)
++        if tandem_model_mask is not None:
++            output["tandem_model_mask"] = torch.tensor(tandem_model_mask, dtype=torch.int64)
+         return output
+ 
+ 
+@@ -172,12 +176,14 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
+     """Padded token ids corresponding to the teacher log probabilities."""
+     routed_experts: Optional[torch.Tensor] = None
+     """Padded routed experts for the total tokens."""
++    tandem_model_mask: Optional[torch.Tensor] = None
+     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
+     """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
+     extra_fields: dict[str, Any] = {}
+     """Extra fields for dynamic addition."""
+ 
+ 
++
+ class DictConfigWrap:
+     """Wrapper for DictConfig to avoid hydra.utils.instantiate recursive resolve."""
+ 
+@@ -599,6 +605,9 @@ class AgentLoopWorker:
+             sampling_params["top_p"] = config.val_kwargs.top_p
+             sampling_params["top_k"] = config.val_kwargs.top_k
+             sampling_params["temperature"] = config.val_kwargs.temperature
++            extra_args = dict(sampling_params.get("extra_args") or {})
++            extra_args["tandem_disabled"] = True
++            sampling_params["extra_args"] = extra_args
+ 
+         # by default, we assume it's a single turn agent
+         if "agent_name" not in batch.non_tensor_batch:
+@@ -837,6 +846,13 @@ class AgentLoopWorker:
+                 pad_token_id=self.tokenizer.pad_token_id,
+             )
+ 
++        tandem_model_mask = None
++        tmm = output.extra_fields.pop("tandem_model_mask", None)
++        if tmm is not None:
++            tmm = list(tmm)[: len(output.response_ids)]
++            tmm_pad = self.rollout_config.response_length - len(tmm)
++            tandem_model_mask = torch.tensor(tmm + [0] * tmm_pad, dtype=torch.int64).unsqueeze(0)
++
+         return _InternalAgentLoopOutput(
+             prompt_ids=prompt_output["input_ids"],
+             response_ids=response_output["input_ids"],
+@@ -846,6 +862,7 @@ class AgentLoopWorker:
+             attention_mask=attention_mask,
+             response_logprobs=response_logprobs,
+             routed_experts=routed_experts,
++            tandem_model_mask=tandem_model_mask,
+             multi_modal_inputs=multi_modal_inputs,
+             multi_modal_data=output.multi_modal_data,
+             mm_processor_kwargs=output.mm_processor_kwargs,
+@@ -1041,6 +1058,10 @@ class AgentLoopWorker:
+             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+         if inputs[0].routed_experts is not None:
+             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
++        if inputs[0].tandem_model_mask is not None:
++            optional_outputs["tandem_model_mask"] = torch.cat(
++                [input.tandem_model_mask for input in inputs], dim=0
++            )
+         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index a74e049..0733304 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -176,6 +176,7 @@ actor_rollout_ref:
+       - re:.*mlp.gate$
+       activation_observer: static_minmax
+       quantization_config_path: null
++    tandem_jr_tkn_weight: 0.0
+     entropy_from_logits_with_chunking: false
+     entropy_from_logits_chunk_size: 2048
+   ref:
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index 6debd88..34a57b3 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -140,6 +140,7 @@ actor_rollout_ref:
+       - re:.*mlp.gate$
+       activation_observer: static_minmax
+       quantization_config_path: null
++    tandem_jr_tkn_weight: 0.0
+   ref:
+     optim:
+       _target_: verl.workers.config.TorchtitanOptimizerConfig
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index d763f28..945818d 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -149,6 +149,7 @@ actor_rollout_ref:
+       - re:.*mlp.gate$
+       activation_observer: static_minmax
+       quantization_config_path: null
++    tandem_jr_tkn_weight: 0.0
+     grad_clip: 1.0
+     ulysses_sequence_parallel_size: 1
+     entropy_from_logits_with_chunking: false
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index ff6513c..e17837c 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -153,6 +153,7 @@ actor_rollout_ref:
+       - re:.*mlp.gate$
+       activation_observer: static_minmax
+       quantization_config_path: null
++    tandem_jr_tkn_weight: 0.0
+     use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
+   ref:
+     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+diff --git a/verl/trainer/config/actor/actor.yaml b/verl/trainer/config/actor/actor.yaml
+index 11547d8..d2f9573 100644
+--- a/verl/trainer/config/actor/actor.yaml
++++ b/verl/trainer/config/actor/actor.yaml
+@@ -310,4 +310,4 @@ qat:
+ 
+   # Path to vLLM quantization config JSON file
+   quantization_config_path: null
+-
++tandem_jr_tkn_weight: 0.0
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index 5e147ee..cd2a101 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -69,6 +69,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             sampling_params["top_p"] = config.val_kwargs.top_p
+             sampling_params["top_k"] = config.val_kwargs.top_k
+             sampling_params["temperature"] = config.val_kwargs.temperature
++            extra_args = dict(sampling_params.get("extra_args") or {})
++            extra_args["tandem_disabled"] = True
++            sampling_params["extra_args"] = extra_args
+ 
+         # by default, we assume it's a single turn agent
+         if "agent_name" not in batch:
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index b40c485..408a1c1 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -98,6 +98,19 @@ logger = logging.getLogger(__name__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+ 
+ 
++def persist_hf_checkpoint(actor_local_path, default_local_dir, global_steps):
++    import shutil
++
++    hf_src = os.path.join(actor_local_path, "huggingface")
++    if not os.path.isdir(hf_src):
++        return None
++    hf_dst = os.path.join(default_local_dir, "hf", f"global_step_{global_steps}")
++    os.makedirs(os.path.dirname(hf_dst), exist_ok=True)
++    shutil.rmtree(hf_dst, ignore_errors=True)
++    shutil.copytree(hf_src, hf_dst)
++    return hf_dst
++
++
+ class PPOTrainer(ABC):
+     """Base class for PPO trainer.
+ 
+@@ -709,6 +722,13 @@ class PPOTrainer(ABC):
+             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+         )
+ 
++        if self.config.trainer.get("persist_hf_model", False):
++            hf_dst = persist_hf_checkpoint(
++                actor_local_path, self.config.trainer.default_local_dir, self.global_steps
++            )
++            if hf_dst is not None:
++                logger.info(f"Persisted HF weights to {hf_dst}")
++
+         # save critic
+         if self.use_critic:
+             critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
+diff --git a/verl/workers/config/actor.py b/verl/workers/config/actor.py
+index b4111f9..06b2c3f 100644
+--- a/verl/workers/config/actor.py
++++ b/verl/workers/config/actor.py
+@@ -185,6 +185,7 @@ class ActorConfig(BaseConfig):
+     rollout_n: int = MISSING  # must be override by sampling config
+     model_config: HFModelConfig = field(default_factory=BaseConfig)
+     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
++    tandem_jr_tkn_weight: float = 0.0
+ 
+     # Store global batch info for loss aggregation:
+     # dp_size: data parallel size
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index cd8df05..59bec9f 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -43,6 +43,14 @@ VLLM_LORA_PATH = "simon_lora_path"
+ VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+ 
+ 
++def _zmq_dir() -> str:
++    import os as _os
++
++    d = f"/tmp/verl-zmq-{_os.getuid()}"
++    _os.makedirs(d, mode=0o700, exist_ok=True)
++    return d
++
++
+ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
+     worker_local_rank = int(worker_local_rank)
+     if parallel_config is None:
+@@ -365,7 +373,7 @@ class vLLMColocateWorkerExtension:
+         vllm_config = getattr(self.model_runner, "vllm_config", None)
+         parallel_config = getattr(vllm_config, "parallel_config", None)
+         local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)
+-        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{local_rank}.sock"
++        return f"ipc://{_zmq_dir()}/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{local_rank}.sock"
+ 
+ 
+ class SuppressSignalInThread:
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 068bab5..707a9dc 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -83,6 +83,21 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(logging.INFO)
+ 
+ 
++def _tandem_extra_visible_devices(node_cuda_visible_devices, env=None):
++    env = os.environ if env is None else env
++    if not env.get("VLLM_TANDEM_CONFIG"):
++        return node_cuda_visible_devices
++    all_gpus = [g.strip() for g in env.get("VLLM_TANDEM_ALL_GPUS", "").split(",") if g.strip()]
++    if not all_gpus:
++        return node_cuda_visible_devices
++    owned = node_cuda_visible_devices.split(",")
++    extra = [g for g in all_gpus if g not in owned]
++    if not extra:
++        return node_cuda_visible_devices
++    logger.info("Tandem: widening server visible devices %s with spare GPUs %s", node_cuda_visible_devices, extra)
++    return ",".join(owned + extra)
++
++
+ class vLLMHttpServer:
+     """vLLM http server in single node, this is equivalent to launch server with command line:
+     ```
+@@ -617,6 +632,8 @@ class vLLMHttpServer:
+                 extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
+                 extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
+                 extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
++        if getattr(final_res.outputs[0], "tandem_model_mask", None) is not None:
++            extra_fields["tandem_model_mask"] = final_res.outputs[0].tandem_model_mask
+         return TokenOutput(
+             token_ids=token_ids,
+             log_probs=log_probs,
+@@ -1033,6 +1050,7 @@ class vLLMReplica(RolloutReplica):
+             node_cuda_visible_devices = ",".join(
+                 worker_cuda_visible_devices[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
+             )
++            node_cuda_visible_devices = _tandem_extra_visible_devices(node_cuda_visible_devices)
+             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
+             prefix = self._get_server_name_prefix()
+             if self.is_reward_model:
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout.py b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+index 052abaf..fa26b22 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout.py
+@@ -48,6 +48,14 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+ 
+ 
++def _zmq_dir() -> str:
++    import os as _os
++
++    d = f"/tmp/verl-zmq-{_os.getuid()}"
++    _os.makedirs(d, mode=0o700, exist_ok=True)
++    return d
++
++
+ def _check_vllm_version_for_sleep_level():
+     # https://github.com/vllm-project/vllm/issues/25171
+     minver = "0.11.0"
+@@ -105,7 +113,7 @@ class ServerAdapter(BaseRollout):
+         # stale socket file) cannot collide on the shared /tmp namespace.
+         local_rank = self.rollout_rank % local_world_size
+         job_id = ray.get_runtime_context().get_job_id()
+-        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
++        self.zmq_handle = f"ipc://{_zmq_dir()}/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+ 
+         self.use_shm = not is_support_ipc()
+         if self.use_shm:
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+index c865b9d..6d4ea99 100644
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -54,6 +54,28 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+     return loss, {}
+ 
+ 
++def _tandem_mask_fields(data):
++    return ["tandem_model_mask"] if "tandem_model_mask" in data.keys() else []
++
++
++def _apply_tandem_senior_gate(config, response_mask, data, metrics):
++    tandem_gate = data.get("tandem_model_mask", None)
++    if tandem_gate is None:
++        return response_mask
++    if tandem_gate.is_nested:
++        tandem_gate = tandem_gate.to_padded_tensor(0)
++    gate = tandem_gate.to(device=response_mask.device).bool()
++    jr_tkn_weight = getattr(config, "tandem_jr_tkn_weight", 0.0)
++    if jr_tkn_weight > 0:
++        gated = response_mask.to(torch.float32) * (gate.to(torch.float32) + (~gate).to(torch.float32) * jr_tkn_weight)
++    else:
++        gated = response_mask & gate
++    denom = response_mask.sum().clamp(min=1).to(torch.float32)
++    senior_frac = ((response_mask & gate).sum().to(torch.float32) / denom).detach()
++    metrics["actor/tandem_senior_token_frac"] = Metric(value=senior_frac, aggregation=AggregationType.MEAN)
++    return gated
++
++
+ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
+     log_prob = no_padding_2_padding(model_output["log_probs"], data)
+@@ -88,9 +110,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+         fields.append("rollout_is_weights")
+     if "ref_log_prob" in data:
+         fields.append("ref_log_prob")
++    fields = fields + _tandem_mask_fields(data)
+     data = data.select(*fields).to_padded_tensor()
+ 
+     response_mask = data["response_mask"].to(bool)
++    response_mask = _apply_tandem_senior_gate(config, response_mask, data, metrics)
+     # compute policy loss
+     old_log_prob = data["old_log_probs"]
+     advantages = data["advantages"]
